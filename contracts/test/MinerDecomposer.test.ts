@@ -1,8 +1,8 @@
-import { expect } from "chai";
+﻿import { expect } from "chai";
 import { ethers } from "hardhat";
 import { loadFixture } from "@nomicfoundation/hardhat-toolbox/network-helpers";
 
-const CAP = 1_000_000_000_000n;
+
 const MULT = 6n;
 const NAND = 938n;
 const LATCH = 0n;
@@ -16,8 +16,8 @@ describe("MinerDecomposer", () => {
     const bem = await ethers.deployContract("MockBEM");
     const mining = await ethers.deployContract("MockMining", [await bem.getAddress()]);
     const circuit = await ethers.deployContract("MockCircuit", ["Behemoth"]);
-    const xNand = await ethers.deployContract("XNAND", [CAP]);
-    const xLatch = await ethers.deployContract("XLATCH", [CAP]);
+    const xNand = await ethers.deployContract("XNAND");
+    const xLatch = await ethers.deployContract("XLATCH");
 
     const decomposer = await ethers.deployContract("MinerDecomposer", [
       await mining.getAddress(),
@@ -27,8 +27,8 @@ describe("MinerDecomposer", () => {
     ]);
     const decoAddr = await decomposer.getAddress();
 
-    await xNand.setMinter(decoAddr);
-    await xLatch.setMinter(decoAddr);
+    await xNand.setMinter(decoAddr); await xNand.lockMinter();
+    await xLatch.setMinter(decoAddr); await xLatch.lockMinter();
     await decomposer.setCpu(await circuit.getAddress(), true);
 
     return { owner, alice, bob, bem, mining, circuit, xNand, xLatch, decomposer, decoAddr };
@@ -252,26 +252,4 @@ describe("MinerDecomposer", () => {
     ).to.be.revertedWithCustomError(decomposer, "StakedToken");
   });
 
-  it("honours the token cap", async () => {
-    const f = await loadFixture(deployFixture);
-    const { alice, circuit, mining } = f;
-    await circuit.mint(alice.address, 1);
-    await mining.setMiner(await circuit.getAddress(), 1, 1000, 1000, 6, 1);
-
-    const tiny = await ethers.deployContract("XNAND", [100]);
-    await tiny.setMinter(f.decoAddr);
-    const d2 = await ethers.deployContract("MinerDecomposer", [
-      await mining.getAddress(),
-      await tiny.getAddress(),
-      await f.xLatch.getAddress(),
-      alice.address,
-    ]);
-    await tiny.setMinter(await d2.getAddress());
-    await d2.connect(alice).setCpu(await circuit.getAddress(), true);
-    await circuit.connect(alice).approve(await d2.getAddress(), 1);
-    await expect(d2.connect(alice).stake(await circuit.getAddress(), 1)).to.be.revertedWithCustomError(
-      tiny,
-      "CapExceeded",
-    );
-  });
 });

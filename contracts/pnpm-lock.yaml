@@ -15,6 +15,9 @@ importers:
       '@nomicfoundation/hardhat-toolbox':
         specifier: 6.1.2
         version: 6.1.2(d31d4707aa35dda9198b8c014b9a8d11)
+      dotenv:
+        specifier: ^18.0.8
+        version: 18.0.8
       hardhat:
         specifier: 2.29.1
         version: 2.29.1(ts-node@10.9.2(@types/node@26.6.5)(typescript@5.6.3))(typescript@5.6.3)
@@ -830,6 +833,11 @@ packages:
   dir-glob@3.0.1:
     resolution: {integrity: sha512-WkrWp9GR4KXfKGYzOLmTuGVi1UWFfws377n9cc55/tb6DuqyF6pcQ5AbiHEshaDpY9v6oaSr2XCDidGmMwdzIA==}
     engines: {node: '>=8'}
+
+  dotenv@18.0.8:
+    resolution: {integrity: sha512-2KDeoFoK/zRtcnbunCDlLG5VWVMcyqeQc6iK65o231nfNAcuGrKoqUQfJFUtBI+QlShk5HKIHxwebBtUl3rEfA==}
+    engines: {node: '>=12'}
+    hasBin: true
 
   dunder-proto@1.0.1:
     resolution: {integrity: sha512-KIN/nDJBQRcXw0MLVhZE9iQHmG68qAVIBg9CqmUYjmQIhgij9U5MFvrqkUL5FbtyyzZuOeOt0zdeRe4UY7ct+A==}
@@ -3031,6 +3039,8 @@ snapshots:
   dir-glob@3.0.1:
     dependencies:
       path-type: 4.0.0
+
+  dotenv@18.0.8: {}
 
   dunder-proto@1.0.1:
     dependencies:
