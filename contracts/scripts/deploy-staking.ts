@@ -6,9 +6,10 @@ import { ethers } from 'hardhat'
  * 需要先在 `.env` 里给出已经部署好的地址：
  *   XNAND_ADDR / XLATCH_ADDR / DECOMPOSER_ADDR(MinerDecomposer)
  *
- * 说明：奖励不再需要转进质押池。BEM 一直留在 MinerDecomposer，
- * 由 pool(owner) 调 `staking.notifyReward(amount)` 划拨额度，
- * 用户 claim 时由质押池调用 `MinerDecomposer.payReward()` 直接付给用户。
+ * 说明：奖励不需要转进质押池。owner 把挖矿收益批量 claim 到 MinerDecomposer 后，
+ * 调 `decomposer.distributeRewards(amount)` 触发分配：矿池锁定额度并通知质押池
+ * 当场更新所有质押者的待领取收益。用户 claim 时由质押池调用
+ * `MinerDecomposer.payReward()` 直接付给用户。
  */
 async function main() {
   const [deployer] = await ethers.getSigners()
@@ -37,15 +38,15 @@ async function main() {
   console.log('  pool  :', await staking.pool())
   console.log('  reward:', await staking.rewardToken())
   console.log('  owner :', await staking.owner())
-  console.log('  durations:', (await staking.rewardsDuration()).toString(), 'seconds')
 
   const decomposer = await ethers.getContractAt('MinerDecomposer', decomposerAddr)
   await (await decomposer.setRewardPayer(stakingAddr)).wait()
   console.log('MinerDecomposer.rewardPayer ->', stakingAddr)
 
   console.log('Done!')
-  console.log('下一步：给质押池注入一轮收益')
-  console.log('  staking.notifyReward(amount)   // 矿池余额需 >= amount')
+  console.log('下一步：归集挖矿收益并触发一轮分配')
+  console.log('  1) owner 调用挖矿合约批量 claim，把 BEM 收进 MinerDecomposer')
+  console.log('  2) decomposer.distributeRewards(amount)   // 矿池可支配余额需 >= amount')
 }
 
 main().catch((e) => {

@@ -9,18 +9,21 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {IRewardSource} from "./IRewardSource.sol";
 
 /// @title XTokenStaking
-/// @notice 矿池质押：把 xNAND / xLATCH 质押进来，按权重份额分 BEM 收益。
+/// @notice xNAND / xLATCH 质押池：按权重份额分 BEM 收益（即时累加模型）。
 ///
 /// 设计要点
 ///  - 一个池子同时接受 xNAND 与 xLATCH，两者各自有可配置权重（默认 1:1）。
 ///    用户权重 = Σ(质押量 × 该代币权重)，收益按 `用户权重 / 总权重` 分配。
-///  - 收益用 Synthetix `StakingRewards` 那套累加器（`rewardPerWeightStored`）
-///    实现：O(1) 计算、O(1) 领取，任意多人、任意次存取都不会算错。
-///  - **奖励不进入本合约**：BEM 一直在矿池（`IRewardSource`）里，
-///    `notifyReward` 只是让矿池划拨额度，用户 `claim` 时由本合约调用
-///    `pool.payReward()` 让矿池直接把 BEM 打给用户。本合约只负责记账。
-///  - 奖励按 `rewardsDuration` 匀速释放（默认 7 天）。谁能决定每轮多少，由
-///    owner 调 `notifyReward()` 决定（分配策略后续再定）。
+///  - 收益用累加器（`rewardPerWeightStored`）实现：O(1) 更新、O(1) 领取，
+///    任意多人、任意次存取都不会算错。
+///  - **奖励即时分配，不按时间线性释放**：矿池（`IRewardSource`）每触发一次
+///    `notifyReward(amount)`，全局指数立刻 += `amount / 总权重`，所有质押者的
+///    待领取收益在同一个区块内瞬间更新。谁能拿到这笔奖励，取决于触发那一刻
+///    谁在质押；没人质押时矿池无法触发（`NoStakers`）。
+///  - **奖励不进入本合约**：BEM 一直留在矿池里。用户 `claim` 时由本合约调用
+///    `pool.payReward()`，矿池直接把 BEM 打给用户。本合约只负责记账。
+///  - `notifyReward` 只能由矿池调用：额度由矿池侧在触发时锁定，矿池负责保证
+///    这些钱始终付得出来。
 ///  - 质押的 xNAND / xLATCH **永远不可被 owner 取走**。
 ///
 /// 注意：合约不做任何 xNAND / xLATCH 的铸造或销毁，只负责托管与分配。
@@ -39,13 +42,6 @@ contract XTokenStaking is Ownable, ReentrancyGuard {
     uint256 public nandWeight = PRECISION;
     uint256 public latchWeight = PRECISION;
 
-    /// @notice 一轮奖励的释放时长。
-    uint256 public rewardsDuration = 7 days;
-
-    uint256 public periodFinish;
-    /// @notice 每秒释放的奖励数量。
-    uint256 public rewardRate;
-    uint256 public lastUpdateTime;
     /// @notice 累计到「每单位权重」的奖励，1e18 精度。
     uint256 public rewardPerWeightStored;
     uint256 public totalWeight;
@@ -66,9 +62,8 @@ contract XTokenStaking is Ownable, ReentrancyGuard {
     event Staked(address indexed account, address indexed token, uint256 amount, uint256 weight);
     event Unstaked(address indexed account, address indexed token, uint256 amount, uint256 weight);
     event RewardPaid(address indexed account, uint256 amount);
-    event RewardAdded(uint256 amount, uint256 rewardRate, uint256 periodFinish);
+    event RewardAdded(uint256 amount, uint256 rewardPerWeight);
     event WeightsUpdated(uint256 nandWeight, uint256 latchWeight);
-    event RewardsDurationUpdated(uint256 duration);
     event Recovered(address indexed token, address indexed to, uint256 amount);
 
     error ZeroAddress();
@@ -76,11 +71,11 @@ contract XTokenStaking is Ownable, ReentrancyGuard {
     error TokenNotAllowed();
     error NothingToClaim();
     error InsufficientStake();
-    error RewardsStillStreaming();
-    error InvalidDuration();
     error ProtectedToken();
     error WeightsLockedWhileStaked();
     error NotAContract();
+    error NotRewardSource();
+    error NoStakers();
 
     constructor(
         address xNand_,
@@ -108,24 +103,12 @@ contract XTokenStaking is Ownable, ReentrancyGuard {
     // Views
     // ---------------------------------------------------------------------
 
-    function lastTimeRewardApplicable() public view returns (uint256) {
-        return block.timestamp < periodFinish ? block.timestamp : periodFinish;
-    }
-
-    /// @notice 当前「每单位权重」已累积的奖励。
-    function rewardPerWeight() public view returns (uint256) {
-        if (totalWeight == 0) return rewardPerWeightStored;
-        return
-            rewardPerWeightStored +
-            ((lastTimeRewardApplicable() - lastUpdateTime) * rewardRate * PRECISION) /
-            totalWeight;
-    }
-
     /// @notice 某地址当前可领取的收益。
     function earned(address account) public view returns (uint256) {
         Account storage a = accounts[account];
         return
-            (a.weight * (rewardPerWeight() - a.rewardPerWeightPaid)) / PRECISION + a.rewards;
+            (a.weight * (rewardPerWeightStored - a.rewardPerWeightPaid)) / PRECISION +
+            a.rewards;
     }
 
     function stakedOf(address account) external view returns (uint256 nand, uint256 latch) {
@@ -137,18 +120,11 @@ contract XTokenStaking is Ownable, ReentrancyGuard {
         return (totalNandStaked, totalLatchStaked);
     }
 
-    /// @notice 本轮（rewardsDuration 秒）总共要释放的奖励。
-    function getRewardForDuration() external view returns (uint256) {
-        return rewardRate * rewardsDuration;
-    }
-
     // ---------------------------------------------------------------------
     // Staking
     // ---------------------------------------------------------------------
 
     modifier updateReward(address account) {
-        rewardPerWeightStored = rewardPerWeight();
-        lastUpdateTime = lastTimeRewardApplicable();
         if (account != address(0)) {
             Account storage a = accounts[account];
             a.rewards = earned(account);
@@ -180,11 +156,10 @@ contract XTokenStaking is Ownable, ReentrancyGuard {
     }
 
     /// @notice 解押，随时可提，没有锁仓与冷却期。
-    function unstake(address token, uint256 amount)
-        external
-        nonReentrant
-        updateReward(msg.sender)
-    {
+    function unstake(
+        address token,
+        uint256 amount
+    ) external nonReentrant updateReward(msg.sender) {
         if (amount == 0) revert ZeroAmount();
         uint256 weight = _weightOf(token, amount);
 
@@ -258,28 +233,16 @@ contract XTokenStaking is Ownable, ReentrancyGuard {
     // Rewards / admin
     // ---------------------------------------------------------------------
 
-    /// @notice 注入一轮收益：向矿池划拨额度（不发币），然后按 `rewardsDuration` 匀速释放。
-    /// 若上一轮还没结束，剩余额度会滚进新一轮，不会丢失。
-    function notifyReward(uint256 amount)
-        external
-        onlyOwner
-        nonReentrant
-        updateReward(address(0))
-    {
+    /// @notice 矿池触发一轮收益分配：把这个 `amount` 立刻按当前权重摊到所有质押者头上。
+    /// 只有矿池可以调用；矿池在调用前已经把这笔 BEM 锁定（保证付得出来）。
+    /// 没有人在质押时不能触发——否则这笔奖励无从分配，矿池继续持有着即可。
+    function notifyReward(uint256 amount) external {
+        if (msg.sender != address(pool)) revert NotRewardSource();
         if (amount == 0) revert ZeroAmount();
-        // 先在矿池侧锁定额度：余额不够会在这里 revert，避免发出付不出来的承诺。
-        pool.reserveRewards(amount);
+        if (totalWeight == 0) revert NoStakers();
 
-        if (block.timestamp >= periodFinish) {
-            rewardRate = amount / rewardsDuration;
-        } else {
-            uint256 leftover = (periodFinish - block.timestamp) * rewardRate;
-            rewardRate = (amount + leftover) / rewardsDuration;
-        }
-
-        lastUpdateTime = block.timestamp;
-        periodFinish = block.timestamp + rewardsDuration;
-        emit RewardAdded(amount, rewardRate, periodFinish);
+        rewardPerWeightStored += (amount * PRECISION) / totalWeight;
+        emit RewardAdded(amount, rewardPerWeightStored);
     }
 
     /// @notice 调整两个质押代币的权重。
@@ -290,14 +253,6 @@ contract XTokenStaking is Ownable, ReentrancyGuard {
         nandWeight = nandWeight_;
         latchWeight = latchWeight_;
         emit WeightsUpdated(nandWeight_, latchWeight_);
-    }
-
-    /// @notice 修改释放时长，只能在一轮结束之后改。
-    function setRewardsDuration(uint256 duration) external onlyOwner {
-        if (block.timestamp < periodFinish) revert RewardsStillStreaming();
-        if (duration == 0) revert InvalidDuration();
-        rewardsDuration = duration;
-        emit RewardsDurationUpdated(duration);
     }
 
     /// @notice 回收误转入的其他代币。

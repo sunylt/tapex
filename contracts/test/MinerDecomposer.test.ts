@@ -347,66 +347,76 @@ describe("MinerDecomposer", () => {
   });
 
   // ---------------------------------------------------------------- //
-  // 矿池作为收益来源：划拨额度 / 领取时直接打给用户                    //
+  // 矿池作为收益来源：触发分配 / 领取时直接付给用户                    //
   // ---------------------------------------------------------------- //
 
   async function rewardFixture() {
     const f = await loadFixture(deployFixture);
-    // 用 alice 模拟质押池，简化测试
-    await f.decomposer.connect(f.owner).setRewardPayer(f.alice.address);
+    // 用 MockRewardSink 顶替质押池：distributeRewards 会真的调它的 notifyReward，
+    // 而发放则由它转发回 payReward（payReward 只认 rewardPayer 本人）。
+    const sink = await ethers.deployContract("MockRewardSink", [f.decoAddr]);
+    await f.decomposer.connect(f.owner).setRewardPayer(await sink.getAddress());
     await f.bem.mint(f.decoAddr, 1_000n);
-    return f;
+    return { ...f, sink };
   }
 
-  it("reserves reward budget and pays users straight from the pool", async () => {
+  it("reserves the reward budget and notifies the staking pool", async () => {
     const f = await rewardFixture();
-    const { alice, bob, bem, decomposer, decoAddr } = f;
+    const { owner, sink, decomposer, decoAddr, bem } = f;
 
-    await decomposer.connect(alice).reserveRewards(400n);
+    await decomposer.connect(owner).distributeRewards(400n);
     expect(await decomposer.reservedRewards()).to.equal(400n);
+    // 通知真的发出去了
+    expect(await sink.lastNotified()).to.equal(400n);
     // 钱没有离开矿池
     expect(await bem.balanceOf(decoAddr)).to.equal(1_000n);
 
-    await decomposer.connect(alice).payReward(bob.address, 150n);
-    expect(await bem.balanceOf(bob.address)).to.equal(150n);
+    await sink.payFromPool(owner.address, 150n);
+    expect(await bem.balanceOf(owner.address)).to.equal(150n);
     expect(await decomposer.reservedRewards()).to.equal(250n);
 
     // 领不完的额度依然锁在矿池里
     expect(await bem.balanceOf(decoAddr)).to.equal(850n);
   });
 
-  it("rejects reward calls from anyone but the payer, and over-budget payouts", async () => {
+  it("rejects triggers from anyone but the owner, and over-budget payouts", async () => {
     const f = await rewardFixture();
-    const { alice, bob, decomposer } = f;
+    const { owner, alice, bob, sink, decomposer } = f;
 
+    // 只有 owner 能触发分配
     await expect(
-      decomposer.connect(bob).reserveRewards(1n),
-    ).to.be.revertedWithCustomError(decomposer, "NotRewardPayer");
+      decomposer.connect(alice).distributeRewards(1n),
+    ).to.be.revertedWithCustomError(decomposer, "OwnableUnauthorizedAccount");
+    // 发放只能由质押池本人发起
     await expect(
       decomposer.connect(bob).payReward(bob.address, 1n),
+    ).to.be.revertedWithCustomError(decomposer, "NotRewardPayer");
+    await expect(
+      decomposer.connect(alice).payReward(bob.address, 1n),
     ).to.be.revertedWithCustomError(decomposer, "NotRewardPayer");
 
     // 不能划拨超过余额的额度
     await expect(
-      decomposer.connect(alice).reserveRewards(1_001n),
+      decomposer.connect(owner).distributeRewards(1_001n),
     ).to.be.revertedWithCustomError(decomposer, "InsufficientReserve");
 
     // 不能付出超过已划拨额度的钱
-    await decomposer.connect(alice).reserveRewards(100n);
-    await expect(
-      decomposer.connect(alice).payReward(bob.address, 101n),
-    ).to.be.revertedWithCustomError(decomposer, "InsufficientReserve");
+    await decomposer.connect(owner).distributeRewards(100n);
+    await expect(sink.payFromPool(bob.address, 101n)).to.be.revertedWithCustomError(
+      decomposer,
+      "InsufficientReserve",
+    );
 
     // 也不能打给零地址
     await expect(
-      decomposer.connect(alice).payReward(ethers.ZeroAddress, 10n),
+      sink.payFromPool(ethers.ZeroAddress, 10n),
     ).to.be.revertedWithCustomError(decomposer, "ZeroAddress");
   });
 
   it("owner cannot withdraw the reserved reward budget", async () => {
     const f = await rewardFixture();
-    const { alice, owner, bem, decomposer, decoAddr } = f;
-    await decomposer.connect(alice).reserveRewards(600n);
+    const { owner, sink, decomposer, decoAddr, bem } = f;
+    await decomposer.connect(owner).distributeRewards(600n);
 
     // 余额 1,000，已划拨 600 -> 最多只能取 400
     await expect(
@@ -415,33 +425,34 @@ describe("MinerDecomposer", () => {
 
     await decomposer.connect(owner).withdraw(await bem.getAddress(), owner.address, 400n);
     expect(await bem.balanceOf(decoAddr)).to.equal(600n);
+    expect(await bem.balanceOf(owner.address)).to.equal(400n);
 
     // 划拨部分仍能正常发放
-    await decomposer.connect(alice).payReward(alice.address, 600n);
-    expect(await bem.balanceOf(alice.address)).to.equal(600n);
+    await sink.payFromPool(owner.address, 600n);
+    expect(await bem.balanceOf(owner.address)).to.equal(1_000n);
     expect(await decomposer.reservedRewards()).to.equal(0n);
   });
 
   it("rewardPayer can only be switched when nothing is reserved", async () => {
     const f = await rewardFixture();
-    const { alice, bob, owner, decomposer } = f;
+    const { owner, sink, bob, decomposer } = f;
 
-    await decomposer.connect(alice).reserveRewards(10n);
+    await decomposer.connect(owner).distributeRewards(10n);
     await expect(
       decomposer.connect(owner).setRewardPayer(bob.address),
     ).to.be.revertedWithCustomError(decomposer, "ReserveNotEmpty");
 
-    await decomposer.connect(alice).payReward(alice.address, 10n);
+    await sink.payFromPool(owner.address, 10n);
     await decomposer.connect(owner).setRewardPayer(bob.address);
     expect(await decomposer.rewardPayer()).to.equal(bob.address);
   });
 
   it("lets the owner clear rounding dust so the payer can be migrated", async () => {
     const f = await rewardFixture();
-    const { alice, bob, owner, decomposer } = f;
+    const { owner, sink, bob, decomposer } = f;
 
-    await decomposer.connect(alice).reserveRewards(3n);
-    await decomposer.connect(alice).payReward(alice.address, 2n); // 剩 1 wei 灰尘
+    await decomposer.connect(owner).distributeRewards(3n);
+    await sink.payFromPool(owner.address, 2n); // 剩 1 wei 灰尘
     expect(await decomposer.reservedRewards()).to.equal(1n);
 
     await expect(
@@ -453,26 +464,41 @@ describe("MinerDecomposer", () => {
     await decomposer.connect(owner).setRewardPayer(bob.address);
   });
 
+  it("refuses to trigger when the payer is not a contract", async () => {
+    const f = await loadFixture(deployFixture);
+    const { owner, alice, bem, decoAddr, decomposer } = f;
+    // 指向 EOA 的话 notifyReward 会「静默成功」，额度被锁死却没人记账
+    await decomposer.connect(owner).setRewardPayer(alice.address);
+    await bem.mint(decoAddr, 10n);
+
+    await expect(
+      decomposer.connect(owner).distributeRewards(10n),
+    ).to.be.revertedWithCustomError(decomposer, "NotAContract");
+    expect(await decomposer.reservedRewards()).to.equal(0n);
+  });
+
   // ---------------------------------------------------------------- //
-  // 复核：收益「待领取」时不能直接划拨，必须先 harvest 进金库           //
+  // 复核：收益「待领取」时不能直接触发，必须先 harvest 进金库          //
   // ---------------------------------------------------------------- //
 
-  it("reward reservation needs BEM that has already been harvested", async () => {
+  it("reward distribution needs BEM that has already been harvested", async () => {
     const f = await loadFixture(deployFixture);
     const { owner, alice, bob, bem, circuit, decomposer, decoAddr } = f;
-    await decomposer.connect(owner).setRewardPayer(alice.address);
+    const sink = await ethers.deployContract("MockRewardSink", [decoAddr]);
+    await decomposer.connect(owner).setRewardPayer(await sink.getAddress());
     await stakeBehemoth(f, alice);
 
     // 矿机在质押期间产出，但收益还挂在 mining 合约里（未 harvest）
     expect(await bem.balanceOf(decoAddr)).to.equal(0n);
     await expect(
-      decomposer.connect(alice).reserveRewards(1n),
+      decomposer.connect(owner).distributeRewards(1n),
     ).to.be.revertedWithCustomError(decomposer, "InsufficientReserve");
 
     // harvest 之后金库才有可划拨的余额
     await decomposer.connect(bob).harvest(await circuit.getAddress(), 156);
     expect(await bem.balanceOf(decoAddr)).to.equal(await f.mining.rewardPerClaim());
-    await decomposer.connect(alice).reserveRewards(1n);
+    await decomposer.connect(owner).distributeRewards(1n);
     expect(await decomposer.reservedRewards()).to.equal(1n);
+    expect(await sink.lastNotified()).to.equal(1n);
   });
 });

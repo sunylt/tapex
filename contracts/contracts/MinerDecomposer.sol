@@ -10,6 +10,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 
 import {IMining} from "./IMining.sol";
 import {MintedToken} from "./MintedToken.sol";
+import {IRewardSink} from "./IRewardSink.sol";
 
 /// @title MinerDecomposer
 /// @notice Shared redemption vault for PoD CPU NFTs.
@@ -22,9 +23,10 @@ import {MintedToken} from "./MintedToken.sol";
 ///  - Anyone holding enough xNAND/xLATCH can `redeem` any escrowed miner by
 ///    burning that miner's price, receiving the NFT. Redemption is
 ///    permissionless and not bound to the original depositor.
-///  - 在押矿机产生的 BEM 留在本合约。owner 通过 `reserveRewards` 把额度划拨给
-///    质押池（XTokenStaking），用户领取时由质押池调用 `payReward` 直接付给用户。
-///    已划拨的额度不能用 `withdraw` 拿走。
+///  - 在押矿机产生的 BEM 留在本合约。owner 归集收益（自己调挖矿合约批量 claim）
+///    之后，调 `distributeRewards` 触发一轮分配：本合约锁定对应额度，并通知
+///    质押池（XTokenStaking）当场更新所有质押者的待领取收益。用户领取时由质押池
+///    调用 `payReward` 直接付给用户。已划拨的额度不能用 `withdraw` 拿走。
 ///
 /// Invariants:
 ///  - total x-token supply == summed price of all escrowed miners.
@@ -95,6 +97,7 @@ contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
     error NotRewardPayer();
     error InsufficientReserve();
     error ReserveNotEmpty();
+    error NotAContract();
 
     constructor(
         address mining_,
@@ -238,15 +241,25 @@ contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
         emit RewardPayerSet(payer);
     }
 
-    /// @notice 质押池划拨一轮奖励额度：只记账，BEM 留在本合约。
-    /// 必须确保余额能覆盖「已划拨 + 本次」，否则后面用户 claim 会付不出来。
-    function reserveRewards(uint256 amount) external nonReentrant {
-        if (msg.sender != rewardPayer) revert NotRewardPayer();
+    /// @notice 触发一轮收益分配（owner 归集完挖矿收益后调用）。
+    /// 只把已经在本合约里的 BEM 锁定额度，然后通知质押池当场更新累加器：
+    /// 所有质押者的待领取收益在同一区块内按权重摊分。
+    /// 余额不够会在这里 revert，避免发出付不出来的承诺；质押池无人质押时
+    /// `notifyReward` 也会 revert，整笔回滚，额度不会被锁死。
+    function distributeRewards(uint256 amount) external onlyOwner nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        if (rewardToken.balanceOf(address(this)) < reservedRewards + amount) {
-            revert InsufficientReserve();
-        }
+        address payer = rewardPayer;
+        if (payer == address(0)) revert ZeroAddress();
+        // 收益接收方必须是合约：指向 EOA 的话 `notifyReward` 会「静默成功」，
+        // 额度被锁死却没有任何质押者被记账。
+        if (payer.code.length == 0) revert NotAContract();
+
+        uint256 balance = rewardToken.balanceOf(address(this));
+        uint256 free = balance > reservedRewards ? balance - reservedRewards : 0;
+        if (amount > free) revert InsufficientReserve();
+
         reservedRewards += amount;
+        IRewardSink(payer).notifyReward(amount);
         emit RewardsReserved(amount);
     }
 
