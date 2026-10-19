@@ -23,10 +23,10 @@ import {IRewardSink} from "./IRewardSink.sol";
 ///  - Anyone holding enough xNAND/xLATCH can `redeem` any escrowed miner by
 ///    burning that miner's price, receiving the NFT. Redemption is
 ///    permissionless and not bound to the original depositor.
-///  - 在押矿机产生的 BEM 留在本合约。owner 归集收益（自己调挖矿合约批量 claim）
-///    之后，调 `distributeRewards` 触发一轮分配：本合约锁定对应额度，并通知
-///    质押池（XTokenStaking）当场更新所有质押者的待领取收益。用户领取时由质押池
-///    调用 `payReward` 直接付给用户。已划拨的额度不能用 `withdraw` 拿走。
+///  - 在押矿机产生的 BEM 留在本合约。运营把收益 claim 进本合约后，调
+///    `distributeRewards()` 触发一轮分配：合约把**全部可分配余额**一次性分掉，
+///    并通知质押池（XTokenStaking）当场更新所有质押者的待领取收益。用户领取时由
+///    质押池调用 `payReward` 直接付给用户。已分配未领取的额度不能用 `withdraw` 拿走。
 ///
 /// Invariants:
 ///  - total x-token supply == summed price of all escrowed miners.
@@ -48,6 +48,11 @@ contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
     address public rewardPayer;
     /// @notice 已划拨给质押池、但用户还没领走的 BEM。这部分不允许被 `withdraw` 拿走。
     uint256 public reservedRewards;
+
+    /// @notice 单次允许释放的最大「灰尘」额度（BEM 8 位小数时 = 0.01 BEM）。
+    /// 由不变量 `reservedRewards >= 用户未领总额`，剩余额度整体 ≤ 这个数时，
+    /// 说明剩下的全是取整灰尘，放掉最多只影响灰尘级别的收益。
+    uint256 public constant MAX_DUST_RELEASE = 1e6;
 
     struct Stake {
         address cpu;
@@ -81,7 +86,7 @@ contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
     event Withdrawn(address indexed token, address indexed to, uint256 amount);
     event Rescued(address indexed cpu, uint256 indexed id, address indexed to);
     event RewardPayerSet(address indexed payer);
-    event RewardsReserved(uint256 amount);
+    event RewardsDistributed(uint256 amount);
     event RewardsReleased(uint256 amount);
     event RewardPaid(address indexed to, uint256 amount);
 
@@ -93,11 +98,12 @@ contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
     error NotRegisteredMiner();
     error ZeroAddress();
     error ZeroPrice();
-    error ZeroAmount();
     error NotRewardPayer();
     error InsufficientReserve();
     error ReserveNotEmpty();
     error NotAContract();
+    error ReserveNotDust();
+    error NothingToDistribute();
 
     constructor(
         address mining_,
@@ -241,13 +247,14 @@ contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
         emit RewardPayerSet(payer);
     }
 
-    /// @notice 触发一轮收益分配（owner 归集完挖矿收益后调用）。
-    /// 只把已经在本合约里的 BEM 锁定额度，然后通知质押池当场更新累加器：
-    /// 所有质押者的待领取收益在同一区块内按权重摊分。
-    /// 余额不够会在这里 revert，避免发出付不出来的承诺；质押池无人质押时
-    /// `notifyReward` 也会 revert，整笔回滚，额度不会被锁死。
-    function distributeRewards(uint256 amount) external onlyOwner nonReentrant {
-        if (amount == 0) revert ZeroAmount();
+    /// @notice 触发一轮收益分配：把合约里**所有可分配**的 BEM 一次性分给当前质押者。
+    ///
+    /// 可分配 = `余额 − reservedRewards`。`reservedRewards` 是已经记在用户账上、
+    /// 只是还没被领走的部分，再分一次等于把同一笔钱承诺两次，所以要扣掉。
+    /// 分配不需要指定数量：运营把收益 claim 进本合约后，调一次本函数就全部分完。
+    ///
+    /// 质押池无人质押时 `notifyReward` 会 revert，整笔回滚，BEM 继续留在本合约。
+    function distributeRewards() external onlyOwner nonReentrant {
         address payer = rewardPayer;
         if (payer == address(0)) revert ZeroAddress();
         // 收益接收方必须是合约：指向 EOA 的话 `notifyReward` 会「静默成功」，
@@ -255,12 +262,12 @@ contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
         if (payer.code.length == 0) revert NotAContract();
 
         uint256 balance = rewardToken.balanceOf(address(this));
-        uint256 free = balance > reservedRewards ? balance - reservedRewards : 0;
-        if (amount > free) revert InsufficientReserve();
+        if (balance <= reservedRewards) revert NothingToDistribute();
+        uint256 amount = balance - reservedRewards;
 
-        reservedRewards += amount;
+        reservedRewards = balance; // 已分配未领取 = 全部余额
         IRewardSink(payer).notifyReward(amount);
-        emit RewardsReserved(amount);
+        emit RewardsDistributed(amount);
     }
 
     /// @notice 用户领取时由质押池调用，BEM 直接由本合约打给用户。
@@ -273,13 +280,16 @@ contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
         emit RewardPaid(to, amount);
     }
 
-    /// @notice 释放一部分划拨额度（退回「可 withdraw」状态）。
-    /// 取整会在 `reservedRewards` 里留下几 wei 灰尘，不清掉的话 `setRewardPayer` 永远无法执行。
-    /// 只能在确认没有未领取奖励时调用；随意调用会让质押池付不出用户应得的钱。
-    function releaseRewardReserve(uint256 amount) external onlyOwner {
-        if (amount > reservedRewards) revert InsufficientReserve();
-        reservedRewards -= amount;
-        emit RewardsReleased(amount);
+    /// @notice 清掉剩余的取整灰尘，让 `reservedRewards` 归零（之后才能 `setRewardPayer` 迁移）。
+    ///
+    /// 安全性来自不变量 `reservedRewards >= 用户未领总额`：只有在剩余额度整体
+    /// ≤ `MAX_DUST_RELEASE` 时才允许调用，所以最多只可能让灰尘级别的收益领不出来，
+    /// **永远动不了用户真正应得的奖励**。额度还大就 revert。
+    function releaseRewardReserve() external onlyOwner {
+        uint256 dust = reservedRewards;
+        if (dust > MAX_DUST_RELEASE) revert ReserveNotDust();
+        reservedRewards = 0;
+        emit RewardsReleased(dust);
     }
 
     /// @notice Recover a CPU NFT that was sent to this vault outside of `stake`.

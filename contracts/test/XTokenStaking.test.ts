@@ -44,9 +44,6 @@ describe("XTokenStaking (即时累加模型)", () => {
     await xNand.mint(bob.address, 1_000);
     await xLatch.mint(bob.address, 1_000);
 
-    // 矿池手里要有 BEM 才付得出来（真实场景来自 owner batch-claim 的在押矿机收益）
-    await bem.mint(poolAddr, REWARD * 10n);
-
     return { owner, alice, bob, bem, mining, circuit, xNand, xLatch, pool, poolAddr, staking, addr };
   }
 
@@ -56,9 +53,10 @@ describe("XTokenStaking (即时累加模型)", () => {
     await f.staking.connect(user).stake(await t.getAddress(), amount);
   }
 
-  /** owner 归集收益后触发一轮分配。 */
+  /** 模拟运营把 `amount` 收益 claim 进矿池，然后触发一次「全部分配」。 */
   async function distribute(f: any, amount: bigint) {
-    await f.pool.connect(f.owner).distributeRewards(amount);
+    await f.bem.mint(f.poolAddr, amount);
+    await f.pool.connect(f.owner).distributeRewards();
   }
 
   it("stakes both tokens and tracks totals + weights", async () => {
@@ -211,6 +209,36 @@ describe("XTokenStaking (即时累加模型)", () => {
     expect(await staking.earned(alice.address)).to.be.closeTo(REWARD * 3n, 10n ** 6n);
   });
 
+  it("each round goes to exactly whoever is staked at that moment", async () => {
+    const f = await loadFixture(deployFixture);
+    const { alice, bob, xNand, staking } = f;
+    const nand = await xNand.getAddress();
+
+    // 第 1 轮：只有 alice 在场
+    await stake(f, alice, "nand", 100n);
+    await distribute(f, REWARD);
+    expect(await staking.earned(alice.address)).to.be.closeTo(REWARD, 10n ** 6n);
+    expect(await staking.earned(bob.address)).to.equal(0n);
+
+    // 轮间换人：alice 全退、bob 进来
+    await staking.connect(alice).unstake(nand, 100n);
+    await stake(f, bob, "nand", 100n);
+
+    // 第 2 轮：只有 bob 在场，全部归 bob
+    await distribute(f, REWARD);
+    expect(await staking.earned(alice.address)).to.be.closeTo(REWARD, 10n ** 6n); // 没变
+    expect(await staking.earned(bob.address)).to.be.closeTo(REWARD, 10n ** 6n);
+
+    // 第 3 轮：alice 再进来（50），bob 还有 100 -> 按 1:2 分
+    await stake(f, alice, "nand", 50n);
+    await distribute(f, REWARD);
+    const aliceDelta = (await staking.earned(alice.address)) - REWARD;
+    const bobDelta = (await staking.earned(bob.address)) - REWARD;
+    expect(aliceDelta).to.be.closeTo(REWARD / 3n, 10n ** 6n);
+    expect(bobDelta).to.be.closeTo((REWARD * 2n) / 3n, 10n ** 6n);
+    expect(aliceDelta + bobDelta).to.be.closeTo(REWARD, 10n ** 6n);
+  });
+
   // ------------------------------------------------------------------ //
   // 触发权限 / 边界                                                    //
   // ------------------------------------------------------------------ //
@@ -220,7 +248,7 @@ describe("XTokenStaking (即时累加模型)", () => {
     const { alice, pool } = f;
     await stake(f, alice, "nand", 100n);
 
-    await expect(pool.connect(alice).distributeRewards(1n)).to.be.revertedWithCustomError(
+    await expect(pool.connect(alice).distributeRewards()).to.be.revertedWithCustomError(
       pool,
       "OwnableUnauthorizedAccount",
     );
@@ -228,21 +256,20 @@ describe("XTokenStaking (即时累加模型)", () => {
 
   it("cannot trigger while nobody is staked", async () => {
     const f = await loadFixture(deployFixture);
-    const { owner, pool, staking } = f;
+    const { owner, bem, pool, poolAddr, staking } = f;
+    await bem.mint(poolAddr, REWARD);
     await expect(
-      pool.connect(owner).distributeRewards(REWARD),
+      pool.connect(owner).distributeRewards(),
     ).to.be.revertedWithCustomError(staking, "NoStakers");
   });
 
-  it("cannot trigger more than the pool's free BEM", async () => {
+  it("reverts when there is nothing new to distribute", async () => {
     const f = await loadFixture(deployFixture);
-    const { owner, alice, bem, pool, poolAddr } = f;
+    const { owner, alice, pool } = f;
     await stake(f, alice, "nand", 100n);
-
-    const tooMuch = (await bem.balanceOf(poolAddr)) + 1n;
     await expect(
-      pool.connect(owner).distributeRewards(tooMuch),
-    ).to.be.revertedWithCustomError(pool, "InsufficientReserve");
+      pool.connect(owner).distributeRewards(),
+    ).to.be.revertedWithCustomError(pool, "NothingToDistribute");
   });
 
   it("notifyReward is callable only by the pool", async () => {
@@ -319,7 +346,8 @@ describe("XTokenStaking (即时累加模型)", () => {
 
     // 用户领完，划拨额度基本归零（只剩取整灰尘）
     expect(await pool.reservedRewards()).to.be.lt(10n ** 6n);
-    expect(await bem.balanceOf(poolAddr)).to.be.gte(REWARD * 9n);
+    // 领完之后矿池里只剩灰尘，且恰好等于 reserved
+    expect(await bem.balanceOf(poolAddr)).to.equal(await pool.reservedRewards());
     expect(await bem.balanceOf(alice.address)).to.be.gt(0n);
   });
 
@@ -349,32 +377,66 @@ describe("XTokenStaking (即时累加模型)", () => {
     await stake(f, alice, "nand", 100n);
     await distribute(f, REWARD);
 
-    const balance = await bem.balanceOf(poolAddr);
-    expect(balance).to.be.gt(REWARD);
-
-    const free = balance - REWARD;
+    // 分配后全部余额都是待发放奖励 -> 一分都提不走
     await expect(
-      pool.connect(owner).withdraw(await bem.getAddress(), owner.address, free + 1n),
+      pool.connect(owner).withdraw(await bem.getAddress(), owner.address, 1n),
     ).to.be.revertedWithCustomError(pool, "InsufficientReserve");
-    if (free > 0n) {
-      await pool.connect(owner).withdraw(await bem.getAddress(), owner.address, free);
-    }
+
+    // 新到账 500（还没分配）-> 只能提这 500
+    await bem.mint(poolAddr, 500n);
+    await expect(
+      pool.connect(owner).withdraw(await bem.getAddress(), owner.address, 501n),
+    ).to.be.revertedWithCustomError(pool, "InsufficientReserve");
+    await pool.connect(owner).withdraw(await bem.getAddress(), owner.address, 500n);
 
     await staking.connect(alice).claim();
     expect(await pool.reservedRewards()).to.be.lt(10n ** 6n);
   });
 
-  it("exit never blocks principal when the reward payout fails", async () => {
+  it("dust release can only clear dust, never real staker rewards", async () => {
     const f = await loadFixture(deployFixture);
-    const { owner, alice, bob, bem, xNand, xLatch, pool, staking } = f;
-    // 两个质押者，保证退出后池子里还有人质押（即时模型下触发需要 totalWeight > 0）
+    const { owner, alice, pool, staking } = f;
     await stake(f, alice, "nand", 100n);
-    await stake(f, alice, "latch", 50n);
-    await stake(f, bob, "nand", 100n);
     await distribute(f, REWARD);
 
-    // 把划拨额度清掉 -> payReward 会 revert
-    await pool.connect(owner).releaseRewardReserve(REWARD);
+    // 剩余额度还是整轮奖励 -> 不允许当作灰尘释放
+    await expect(
+      pool.connect(owner).releaseRewardReserve(),
+    ).to.be.revertedWithCustomError(pool, "ReserveNotDust");
+
+    // 用户领完之后只剩灰尘 -> 可以清掉，然后迁移 payer
+    await staking.connect(alice).claim();
+    const dust = await pool.reservedRewards();
+    expect(dust).to.be.lte(await pool.MAX_DUST_RELEASE());
+
+    await pool.connect(owner).releaseRewardReserve();
+    expect(await pool.reservedRewards()).to.equal(0n);
+    await pool.connect(owner).setRewardPayer(owner.address);
+  });
+
+  it("exit never blocks principal when the reward payout fails", async () => {
+    const f = await loadFixture(deployFixture);
+    const { owner, alice, bem, xNand, xLatch } = f;
+
+    // 用可开关的 mock 收益来源，精确模拟「矿池付不出钱」
+    const source = await ethers.deployContract("MockRewardSource", [await bem.getAddress()]);
+    const staking = await ethers.deployContract("XTokenStaking", [
+      await xNand.getAddress(),
+      await xLatch.getAddress(),
+      await source.getAddress(),
+      owner.address,
+    ]);
+    const stakingAddr = await staking.getAddress();
+    await bem.mint(await source.getAddress(), REWARD);
+    await xNand.connect(alice).approve(stakingAddr, ethers.MaxUint256);
+    await xLatch.connect(alice).approve(stakingAddr, ethers.MaxUint256);
+
+    await staking.connect(alice).stake(await xNand.getAddress(), 100n);
+    await staking.connect(alice).stake(await xLatch.getAddress(), 50n);
+    await source.trigger(stakingAddr, REWARD);
+
+    // 让 payReward 开始失败
+    await source.setPayReverts(true);
     const bemBefore = await bem.balanceOf(alice.address);
 
     // 本金照退，交易不 revert
@@ -388,11 +450,10 @@ describe("XTokenStaking (即时累加模型)", () => {
     expect(account.rewards).to.be.gt(0n);
     expect(account.weight).to.equal(0n);
 
-    // 矿池重新有额度之后依然能领
-    await distribute(f, REWARD);
-    const before = await bem.balanceOf(alice.address);
+    // 矿池恢复之后依然能领
+    await source.setPayReverts(false);
     await staking.connect(alice).claim();
-    expect((await bem.balanceOf(alice.address)) - before).to.equal(account.rewards);
+    expect((await bem.balanceOf(alice.address)) - bemBefore).to.equal(account.rewards);
   });
 
   // ------------------------------------------------------------------ //
@@ -429,6 +490,23 @@ describe("XTokenStaking (即时累加模型)", () => {
     await expect(
       staking.connect(owner).setWeights(PRECISION, PRECISION),
     ).to.be.revertedWithCustomError(staking, "WeightsLockedWhileStaked");
+  });
+
+  it("rejects a zero weight (it would make rewards undistributable)", async () => {
+    const f = await loadFixture(deployFixture);
+    const { owner, staking } = f;
+
+    await expect(
+      staking.connect(owner).setWeights(0n, PRECISION),
+    ).to.be.revertedWithCustomError(staking, "InvalidWeight");
+    await expect(
+      staking.connect(owner).setWeights(PRECISION, 0n),
+    ).to.be.revertedWithCustomError(staking, "InvalidWeight");
+
+    // 非 0 权重正常生效
+    await staking.connect(owner).setWeights(2n * PRECISION, PRECISION);
+    expect(await staking.nandWeight()).to.equal(2n * PRECISION);
+    expect(await staking.latchWeight()).to.equal(PRECISION);
   });
 
   it("rejects bad input", async () => {

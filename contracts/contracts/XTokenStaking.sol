@@ -76,6 +76,7 @@ contract XTokenStaking is Ownable, ReentrancyGuard {
     error NotAContract();
     error NotRewardSource();
     error NoStakers();
+    error InvalidWeight();
 
     constructor(
         address xNand_,
@@ -248,8 +249,11 @@ contract XTokenStaking is Ownable, ReentrancyGuard {
     /// @notice 调整两个质押代币的权重。
     /// 只允许在池子里没有任何质押时修改：用户权重是「质押量 × 当时权重」算出来的，
     /// 质押期间改权重会让 `totalWeight` 与个人权重对不上（早晚解押的人会算错账）。
+    /// 权重不能为 0：否则质押该代币的人权重为 0，`totalWeight` 可能恒为 0，
+    /// `notifyReward` 会一直 `NoStakers`，奖励永远分不出去。
     function setWeights(uint256 nandWeight_, uint256 latchWeight_) external onlyOwner {
         if (totalWeight != 0) revert WeightsLockedWhileStaked();
+        if (nandWeight_ == 0 || latchWeight_ == 0) revert InvalidWeight();
         nandWeight = nandWeight_;
         latchWeight = latchWeight_;
         emit WeightsUpdated(nandWeight_, latchWeight_);

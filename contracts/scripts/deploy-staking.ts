@@ -7,7 +7,7 @@ import { ethers } from 'hardhat'
  *   XNAND_ADDR / XLATCH_ADDR / DECOMPOSER_ADDR(MinerDecomposer)
  *
  * 说明：奖励不需要转进质押池。owner 把挖矿收益批量 claim 到 MinerDecomposer 后，
- * 调 `decomposer.distributeRewards(amount)` 触发分配：矿池锁定额度并通知质押池
+ * 调 `decomposer.distributeRewards()` 触发分配：矿池把全部可分配余额分掉并通知质押池
  * 当场更新所有质押者的待领取收益。用户 claim 时由质押池调用
  * `MinerDecomposer.payReward()` 直接付给用户。
  */
@@ -46,7 +46,7 @@ async function main() {
   console.log('Done!')
   console.log('下一步：归集挖矿收益并触发一轮分配')
   console.log('  1) owner 调用挖矿合约批量 claim，把 BEM 收进 MinerDecomposer')
-  console.log('  2) decomposer.distributeRewards(amount)   // 矿池可支配余额需 >= amount')
+  console.log('  2) decomposer.distributeRewards()         // 把合约里可分配的全部 BEM 分掉')
 }
 
 main().catch((e) => {
