@@ -1,4 +1,4 @@
-﻿import { ethers } from 'hardhat'
+import { ethers } from 'hardhat'
 
 async function main() {
   const [deployer] = await ethers.getSigners()
@@ -6,6 +6,9 @@ async function main() {
   console.log('Balance:', (await ethers.provider.getBalance(deployer.address)).toString())
 
   const MINING_ADDR = '0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46'
+  // BEM（挖矿收益代币）：矿池把在押矿机的收益收在这里，也是质押池的奖励来源。
+  const REWARD_TOKEN_ADDR =
+    process.env.BEM_ADDR || '0x5ce033B2bFCa3Af30b3e8C8457DeaF776A8b695a'
 
   const xNand = await ethers.deployContract('XNAND')
   await xNand.waitForDeployment()
@@ -21,6 +24,7 @@ async function main() {
     MINING_ADDR,
     xNandAddr,
     xLatchAddr,
+    REWARD_TOKEN_ADDR,
     deployer.address,
   ])
   await decomposer.waitForDeployment()

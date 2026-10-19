@@ -1,48 +1,19 @@
 <script setup lang="ts">
-import { RouterLink, RouterView } from 'vue-router'
+import { onMounted, onUnmounted } from 'vue'
+import { RouterView } from 'vue-router'
+
+import AppHeader from '@/components/AppHeader.vue'
+import { useMiningStore } from '@/stores/mining'
+
+const mining = useMiningStore()
+
+// The header wallet button lives on every page, so the wallet lifecycle is
+// owned by the app shell rather than by an individual view.
+onMounted(() => void mining.init())
+onUnmounted(() => mining.teardown())
 </script>
 
 <template>
-  <header>
-    <div class="wrapper">
-      <nav>
-        <RouterLink to="/">Home</RouterLink>
-        <RouterLink to="/pod">PoD 挖矿</RouterLink>
-        <RouterLink to="/about">About</RouterLink>
-      </nav>
-    </div>
-  </header>
-
+  <AppHeader />
   <RouterView />
 </template>
-
-<style scoped>
-header {
-  line-height: 1.5;
-}
-
-nav {
-  width: 100%;
-  font-size: 13px;
-  text-align: center;
-  padding: 1rem 0;
-}
-
-nav a.router-link-exact-active {
-  color: var(--color-text);
-}
-
-nav a.router-link-exact-active:hover {
-  background-color: transparent;
-}
-
-nav a {
-  display: inline-block;
-  padding: 0 1rem;
-  border-left: 1px solid var(--color-border);
-}
-
-nav a:first-of-type {
-  border: 0;
-}
-</style>

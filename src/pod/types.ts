@@ -2,6 +2,12 @@ export interface CpuInfo {
   address: string
   multiplier: number
   fromBlock: number
+  /**
+   * 该型号的矿机是否允许质押进矿池（拆解）。
+   * 链上以 `MinerDecomposer.cpuAllowed(cpu)` 为准，这里是前端开关：
+   * 关掉后卡片上的「拆解」按钮会置灰，避免用户白跑一笔会被 revert 的交易。
+   */
+  stakeEnabled: boolean
 }
 
 export interface PodContracts {

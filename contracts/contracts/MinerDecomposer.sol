@@ -22,16 +22,30 @@ import {MintedToken} from "./MintedToken.sol";
 ///  - Anyone holding enough xNAND/xLATCH can `redeem` any escrowed miner by
 ///    burning that miner's price, receiving the NFT. Redemption is
 ///    permissionless and not bound to the original depositor.
+///  - 在押矿机产生的 BEM 留在本合约。owner 通过 `reserveRewards` 把额度划拨给
+///    质押池（XTokenStaking），用户领取时由质押池调用 `payReward` 直接付给用户。
+///    已划拨的额度不能用 `withdraw` 拿走。
 ///
-/// Invariant: total x-token supply == summed price of all escrowed miners.
+/// Invariants:
+///  - total x-token supply == summed price of all escrowed miners.
+///    This holds because x-tokens can only be minted on `stake` and only burned
+///    by the decomposer itself inside `redeem` (`MintedToken.burnFrom` is minter-only).
+///  - rewardToken.balanceOf(this) >= reservedRewards (已划拨的奖励永远付得出来).
 contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
     using SafeERC20 for IERC20;
 
     IMining public immutable mining;
     MintedToken public immutable xNand;
     MintedToken public immutable xLatch;
+    /// @notice 挖矿收益代币（BEM）。矿池的收益来源，也是质押池发放的奖励。
+    IERC20 public immutable rewardToken;
 
     mapping(address cpu => bool allowed) public cpuAllowed;
+
+    /// @notice 被授权从本合约发放奖励的质押池（XTokenStaking）。
+    address public rewardPayer;
+    /// @notice 已划拨给质押池、但用户还没领走的 BEM。这部分不允许被 `withdraw` 拿走。
+    uint256 public reservedRewards;
 
     struct Stake {
         address cpu;
@@ -64,6 +78,10 @@ contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
     event Harvested(address indexed cpu, uint256 indexed id);
     event Withdrawn(address indexed token, address indexed to, uint256 amount);
     event Rescued(address indexed cpu, uint256 indexed id, address indexed to);
+    event RewardPayerSet(address indexed payer);
+    event RewardsReserved(uint256 amount);
+    event RewardsReleased(uint256 amount);
+    event RewardPaid(address indexed to, uint256 amount);
 
     error CpuNotAllowed();
     error NotCpuOwner();
@@ -72,19 +90,31 @@ contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
     error StakedToken();
     error NotRegisteredMiner();
     error ZeroAddress();
+    error ZeroPrice();
+    error ZeroAmount();
+    error NotRewardPayer();
+    error InsufficientReserve();
+    error ReserveNotEmpty();
 
     constructor(
         address mining_,
         address xNand_,
         address xLatch_,
+        address rewardToken_,
         address owner_
     ) Ownable(owner_) {
-        if (mining_ == address(0) || xNand_ == address(0) || xLatch_ == address(0)) {
+        if (
+            mining_ == address(0) ||
+            xNand_ == address(0) ||
+            xLatch_ == address(0) ||
+            rewardToken_ == address(0)
+        ) {
             revert ZeroAddress();
         }
         mining = IMining(mining_);
         xNand = MintedToken(xNand_);
         xLatch = MintedToken(xLatch_);
+        rewardToken = IERC20(rewardToken_);
     }
 
     function setCpu(address cpu, bool allowed) external onlyOwner {
@@ -123,6 +153,9 @@ contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
 
         uint256 nandAmount = uint256(m.nandBurn) * uint256(m.mult);
         uint256 latchAmount = uint256(m.latchBurn) * uint256(m.mult);
+        // A miner worth nothing would be redeemable by anyone for free, so it
+        // must never enter the vault.
+        if (nandAmount == 0 && latchAmount == 0) revert ZeroPrice();
 
         stakes[key] = Stake({
             cpu: cpu,
@@ -144,12 +177,17 @@ contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
 
     /// @notice Redeem a specific escrowed miner by burning its price in
     /// x-tokens. Permissionless: the caller only needs enough xNAND/xLATCH.
+    ///
+    /// Rewards accrued while the miner was escrowed belong to the vault, so the
+    /// pending claim is settled *before* the NFT leaves. If that claim fails the
+    /// whole redemption reverts — releasing the NFT anyway would hand those
+    /// rewards to the redeemer.
     function redeem(address cpu, uint256 id) external nonReentrant {
         bytes32 key = mining.minerKey(cpu, id);
         Stake memory s = stakes[key];
         if (s.depositor == address(0)) revert NotStaked();
 
-        _tryClaim(key); // rewards accrued while escrowed stay with the vault
+        mining.claim(key);
 
         _removeKey(key);
         delete stakes[key];
@@ -177,9 +215,58 @@ contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
     // ---------------------------------------------------------------------
 
     /// @notice Owner can move any ERC20 token (e.g. mined BEM) out of the vault.
+    /// BEM 中已经划拨给质押池的部分（`reservedRewards`）动不了，否则用户 claim 会失败。
     function withdraw(address token, address to, uint256 amount) external onlyOwner nonReentrant {
+        if (token == address(rewardToken)) {
+            uint256 balance = rewardToken.balanceOf(address(this));
+            uint256 free = balance > reservedRewards ? balance - reservedRewards : 0;
+            if (amount > free) revert InsufficientReserve();
+        }
         IERC20(token).safeTransfer(to, amount);
         emit Withdrawn(token, to, amount);
+    }
+
+    // ---------------------------------------------------------------------
+    // 质押池收益（BEM 由本合约持有，领取时直接付给用户）
+    // ---------------------------------------------------------------------
+
+    /// @notice 指定唯一可以从本合约发放奖励的质押池。
+    /// 只允许在「没有未领取奖励」时切换，避免把已经划拨出去的额度带走。
+    function setRewardPayer(address payer) external onlyOwner {
+        if (reservedRewards != 0) revert ReserveNotEmpty();
+        rewardPayer = payer;
+        emit RewardPayerSet(payer);
+    }
+
+    /// @notice 质押池划拨一轮奖励额度：只记账，BEM 留在本合约。
+    /// 必须确保余额能覆盖「已划拨 + 本次」，否则后面用户 claim 会付不出来。
+    function reserveRewards(uint256 amount) external nonReentrant {
+        if (msg.sender != rewardPayer) revert NotRewardPayer();
+        if (amount == 0) revert ZeroAmount();
+        if (rewardToken.balanceOf(address(this)) < reservedRewards + amount) {
+            revert InsufficientReserve();
+        }
+        reservedRewards += amount;
+        emit RewardsReserved(amount);
+    }
+
+    /// @notice 用户领取时由质押池调用，BEM 直接由本合约打给用户。
+    function payReward(address to, uint256 amount) external nonReentrant {
+        if (msg.sender != rewardPayer) revert NotRewardPayer();
+        if (to == address(0)) revert ZeroAddress();
+        if (amount > reservedRewards) revert InsufficientReserve();
+        reservedRewards -= amount;
+        rewardToken.safeTransfer(to, amount);
+        emit RewardPaid(to, amount);
+    }
+
+    /// @notice 释放一部分划拨额度（退回「可 withdraw」状态）。
+    /// 取整会在 `reservedRewards` 里留下几 wei 灰尘，不清掉的话 `setRewardPayer` 永远无法执行。
+    /// 只能在确认没有未领取奖励时调用；随意调用会让质押池付不出用户应得的钱。
+    function releaseRewardReserve(uint256 amount) external onlyOwner {
+        if (amount > reservedRewards) revert InsufficientReserve();
+        reservedRewards -= amount;
+        emit RewardsReleased(amount);
     }
 
     /// @notice Recover a CPU NFT that was sent to this vault outside of `stake`.
@@ -214,9 +301,5 @@ contract MinerDecomposer is Ownable, ReentrancyGuard, IERC721Receiver {
         }
         _stakedKeys.pop();
         delete _keyIndex[key];
-    }
-
-    function _tryClaim(bytes32 key) private {
-        try mining.claim(key) {} catch {}
     }
 }

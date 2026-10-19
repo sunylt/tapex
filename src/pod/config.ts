@@ -26,16 +26,15 @@ export const POD_CONFIG: PodConfig = {
       address: '0x1F5Cb4aeaE1807Bf60c3b9C0D8aDBCC14e91f12C',
       multiplier: 6,
       fromBlock: 116079229,
+      // 质押开关：镜像 MinerDecomposer.cpuAllowed(Behemoth)
+      stakeEnabled: true,
     },
     TapeOut: {
       address: '0xb1024b89886B9a34Aa4ff5F31C411D708b20a14C',
       multiplier: 1,
       fromBlock: 116140775,
-    },
-    RefBench: {
-      address: '0xF4412C52ec3DDf7CAf5f518B6662F77B02Bde28E',
-      multiplier: 1,
-      fromBlock: 117234441,
+      // 质押开关：镜像 MinerDecomposer.cpuAllowed(TapeOut)
+      stakeEnabled: true,
     },
   },
   // Max `eth_getLogs` range accepted by tapeout.net/rpc.

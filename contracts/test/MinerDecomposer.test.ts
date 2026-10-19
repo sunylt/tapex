@@ -1,4 +1,4 @@
-﻿import { expect } from "chai";
+import { expect } from "chai";
 import { ethers } from "hardhat";
 import { loadFixture } from "@nomicfoundation/hardhat-toolbox/network-helpers";
 
@@ -23,6 +23,7 @@ describe("MinerDecomposer", () => {
       await mining.getAddress(),
       await xNand.getAddress(),
       await xLatch.getAddress(),
+      await bem.getAddress(),
       owner.address,
     ]);
     const decoAddr = await decomposer.getAddress();
@@ -252,4 +253,226 @@ describe("MinerDecomposer", () => {
     ).to.be.revertedWithCustomError(decomposer, "StakedToken");
   });
 
+  // ---------------------------------------------------------------- //
+  // Rules added after the contract review                             //
+  // ---------------------------------------------------------------- //
+
+  it("holders can no longer burn x-tokens (only redeem can)", async () => {
+    const f = await loadFixture(deployFixture);
+    const { alice, xNand, decomposer, decoAddr } = f;
+    await stakeBehemoth(f, alice);
+
+    // ERC20Burnable is gone: there is no public `burn`, and `burnFrom` is minter-only.
+    expect(xNand.interface.getFunction("burn")).to.equal(null);
+    expect(xNand.interface.getFunction("burnFrom")).to.not.equal(null);
+    await expect(
+      xNand.connect(alice).burnFrom(alice.address, 1n),
+    ).to.be.revertedWithCustomError(xNand, "NotMinter");
+
+    // the decomposer may burn, but only with an allowance and only via redeem
+    await expect(
+      decomposer.connect(alice).redeem(await f.circuit.getAddress(), 156),
+    ).to.be.reverted;
+    await xNand.connect(alice).approve(decoAddr, ethers.MaxUint256);
+    await decomposer.connect(alice).redeem(await f.circuit.getAddress(), 156);
+    expect(await xNand.totalSupply()).to.equal(0n);
+  });
+
+  it("mints and burns both components when latchBurn is non-zero", async () => {
+    const f = await loadFixture(deployFixture);
+    const { alice, circuit, mining, xNand, xLatch, decomposer, decoAddr } = f;
+    const cpu = await circuit.getAddress();
+
+    await circuit.mint(alice.address, 321);
+    await circuit.connect(alice).approve(decoAddr, 321);
+    await mining.setMiner(cpu, 321, NAND, 200, MULT, 1);
+    await decomposer.connect(alice).stake(cpu, 321);
+
+    expect(await xNand.balanceOf(alice.address)).to.equal(NAND * MULT);
+    expect(await xLatch.balanceOf(alice.address)).to.equal(200n * MULT);
+
+    await xNand.connect(alice).approve(decoAddr, ethers.MaxUint256);
+    await xLatch.connect(alice).approve(decoAddr, ethers.MaxUint256);
+    await decomposer.connect(alice).redeem(cpu, 321);
+
+    expect(await xNand.totalSupply()).to.equal(0n);
+    expect(await xLatch.totalSupply()).to.equal(0n);
+    expect(await circuit.ownerOf(321)).to.equal(alice.address);
+  });
+
+  it("refuses to stake a miner whose price is zero", async () => {
+    const f = await loadFixture(deployFixture);
+    const { alice, circuit, decomposer, mining } = f;
+    await circuit.mint(alice.address, 777);
+    await circuit.connect(alice).approve(f.decoAddr, 777);
+    // nandBurn = 0, latchBurn = 0 -> free for anyone to redeem
+    await mining.setMiner(await circuit.getAddress(), 777, 0, 0, MULT, 1);
+
+    await expect(
+      decomposer.connect(alice).stake(await circuit.getAddress(), 777),
+    ).to.be.revertedWithCustomError(decomposer, "ZeroPrice");
+
+    // mult = 0 has the same effect
+    await mining.setMiner(await circuit.getAddress(), 777, NAND, LATCH, 0, 1);
+    await expect(
+      decomposer.connect(alice).stake(await circuit.getAddress(), 777),
+    ).to.be.revertedWithCustomError(decomposer, "ZeroPrice");
+  });
+
+  it("redeem reverts when the pending claim fails, so rewards stay with the vault", async () => {
+    const f = await loadFixture(deployFixture);
+    const { alice, bob, bem, circuit, mining, xNand, decomposer, decoAddr } = f;
+    await stakeBehemoth(f, alice);
+
+    await xNand.connect(alice).transfer(bob.address, PRICE_NAND);
+    await xNand.connect(bob).approve(decoAddr, ethers.MaxUint256);
+
+    await mining.setClaimReverts(true);
+    await expect(
+      decomposer.connect(bob).redeem(await circuit.getAddress(), 156),
+    ).to.be.revertedWith("claim disabled");
+
+    // nothing moved: NFT still escrowed, bob's tokens intact, no reward paid out
+    expect(await circuit.ownerOf(156)).to.equal(decoAddr);
+    expect(await xNand.balanceOf(bob.address)).to.equal(PRICE_NAND);
+    expect(await decomposer.stakedCount()).to.equal(1);
+    expect(await bem.balanceOf(bob.address)).to.equal(0);
+
+    // once claiming works again the vault takes the reward and the redeem goes through
+    await mining.setClaimReverts(false);
+    await decomposer.connect(bob).redeem(await circuit.getAddress(), 156);
+    expect(await circuit.ownerOf(156)).to.equal(bob.address);
+    expect(await bem.balanceOf(decoAddr)).to.equal(await mining.rewardPerClaim());
+    expect(await bem.balanceOf(bob.address)).to.equal(0);
+  });
+
+  // ---------------------------------------------------------------- //
+  // 矿池作为收益来源：划拨额度 / 领取时直接打给用户                    //
+  // ---------------------------------------------------------------- //
+
+  async function rewardFixture() {
+    const f = await loadFixture(deployFixture);
+    // 用 alice 模拟质押池，简化测试
+    await f.decomposer.connect(f.owner).setRewardPayer(f.alice.address);
+    await f.bem.mint(f.decoAddr, 1_000n);
+    return f;
+  }
+
+  it("reserves reward budget and pays users straight from the pool", async () => {
+    const f = await rewardFixture();
+    const { alice, bob, bem, decomposer, decoAddr } = f;
+
+    await decomposer.connect(alice).reserveRewards(400n);
+    expect(await decomposer.reservedRewards()).to.equal(400n);
+    // 钱没有离开矿池
+    expect(await bem.balanceOf(decoAddr)).to.equal(1_000n);
+
+    await decomposer.connect(alice).payReward(bob.address, 150n);
+    expect(await bem.balanceOf(bob.address)).to.equal(150n);
+    expect(await decomposer.reservedRewards()).to.equal(250n);
+
+    // 领不完的额度依然锁在矿池里
+    expect(await bem.balanceOf(decoAddr)).to.equal(850n);
+  });
+
+  it("rejects reward calls from anyone but the payer, and over-budget payouts", async () => {
+    const f = await rewardFixture();
+    const { alice, bob, decomposer } = f;
+
+    await expect(
+      decomposer.connect(bob).reserveRewards(1n),
+    ).to.be.revertedWithCustomError(decomposer, "NotRewardPayer");
+    await expect(
+      decomposer.connect(bob).payReward(bob.address, 1n),
+    ).to.be.revertedWithCustomError(decomposer, "NotRewardPayer");
+
+    // 不能划拨超过余额的额度
+    await expect(
+      decomposer.connect(alice).reserveRewards(1_001n),
+    ).to.be.revertedWithCustomError(decomposer, "InsufficientReserve");
+
+    // 不能付出超过已划拨额度的钱
+    await decomposer.connect(alice).reserveRewards(100n);
+    await expect(
+      decomposer.connect(alice).payReward(bob.address, 101n),
+    ).to.be.revertedWithCustomError(decomposer, "InsufficientReserve");
+
+    // 也不能打给零地址
+    await expect(
+      decomposer.connect(alice).payReward(ethers.ZeroAddress, 10n),
+    ).to.be.revertedWithCustomError(decomposer, "ZeroAddress");
+  });
+
+  it("owner cannot withdraw the reserved reward budget", async () => {
+    const f = await rewardFixture();
+    const { alice, owner, bem, decomposer, decoAddr } = f;
+    await decomposer.connect(alice).reserveRewards(600n);
+
+    // 余额 1,000，已划拨 600 -> 最多只能取 400
+    await expect(
+      decomposer.connect(owner).withdraw(await bem.getAddress(), owner.address, 401n),
+    ).to.be.revertedWithCustomError(decomposer, "InsufficientReserve");
+
+    await decomposer.connect(owner).withdraw(await bem.getAddress(), owner.address, 400n);
+    expect(await bem.balanceOf(decoAddr)).to.equal(600n);
+
+    // 划拨部分仍能正常发放
+    await decomposer.connect(alice).payReward(alice.address, 600n);
+    expect(await bem.balanceOf(alice.address)).to.equal(600n);
+    expect(await decomposer.reservedRewards()).to.equal(0n);
+  });
+
+  it("rewardPayer can only be switched when nothing is reserved", async () => {
+    const f = await rewardFixture();
+    const { alice, bob, owner, decomposer } = f;
+
+    await decomposer.connect(alice).reserveRewards(10n);
+    await expect(
+      decomposer.connect(owner).setRewardPayer(bob.address),
+    ).to.be.revertedWithCustomError(decomposer, "ReserveNotEmpty");
+
+    await decomposer.connect(alice).payReward(alice.address, 10n);
+    await decomposer.connect(owner).setRewardPayer(bob.address);
+    expect(await decomposer.rewardPayer()).to.equal(bob.address);
+  });
+
+  it("lets the owner clear rounding dust so the payer can be migrated", async () => {
+    const f = await rewardFixture();
+    const { alice, bob, owner, decomposer } = f;
+
+    await decomposer.connect(alice).reserveRewards(3n);
+    await decomposer.connect(alice).payReward(alice.address, 2n); // 剩 1 wei 灰尘
+    expect(await decomposer.reservedRewards()).to.equal(1n);
+
+    await expect(
+      decomposer.connect(owner).releaseRewardReserve(2n),
+    ).to.be.revertedWithCustomError(decomposer, "InsufficientReserve");
+
+    await decomposer.connect(owner).releaseRewardReserve(1n);
+    expect(await decomposer.reservedRewards()).to.equal(0n);
+    await decomposer.connect(owner).setRewardPayer(bob.address);
+  });
+
+  // ---------------------------------------------------------------- //
+  // 复核：收益「待领取」时不能直接划拨，必须先 harvest 进金库           //
+  // ---------------------------------------------------------------- //
+
+  it("reward reservation needs BEM that has already been harvested", async () => {
+    const f = await loadFixture(deployFixture);
+    const { owner, alice, bob, bem, circuit, decomposer, decoAddr } = f;
+    await decomposer.connect(owner).setRewardPayer(alice.address);
+    await stakeBehemoth(f, alice);
+
+    // 矿机在质押期间产出，但收益还挂在 mining 合约里（未 harvest）
+    expect(await bem.balanceOf(decoAddr)).to.equal(0n);
+    await expect(
+      decomposer.connect(alice).reserveRewards(1n),
+    ).to.be.revertedWithCustomError(decomposer, "InsufficientReserve");
+
+    // harvest 之后金库才有可划拨的余额
+    await decomposer.connect(bob).harvest(await circuit.getAddress(), 156);
+    expect(await bem.balanceOf(decoAddr)).to.equal(await f.mining.rewardPerClaim());
+    await decomposer.connect(alice).reserveRewards(1n);
+    expect(await decomposer.reservedRewards()).to.equal(1n);
+  });
 });

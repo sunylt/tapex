@@ -10,6 +10,8 @@ import {MockBEM} from "./MockBEM.sol";
 contract MockMining is IMining {
     MockBEM public immutable bem;
     uint256 public rewardPerClaim = 1e18;
+    /// @notice Test switch: make `claim` revert so failure paths can be exercised.
+    bool public claimReverts;
 
     mapping(bytes32 => Miner) private _miners;
     mapping(bytes32 => uint256) private _lastClaim;
@@ -20,6 +22,10 @@ contract MockMining is IMining {
 
     function setRewardPerClaim(uint256 amount) external {
         rewardPerClaim = amount;
+    }
+
+    function setClaimReverts(bool value) external {
+        claimReverts = value;
     }
 
     function minerKey(address circuits, uint256 circuitId) external pure returns (bytes32) {
@@ -50,6 +56,7 @@ contract MockMining is IMining {
 
     /// @notice Mints a fixed reward to the current owner of the circuit NFT.
     function claim(bytes32 key) external {
+        require(!claimReverts, "claim disabled");
         Miner memory m = _miners[key];
         require(m.circuits != address(0), "no miner");
         address owner = IERC721(m.circuits).ownerOf(m.circuitId);
