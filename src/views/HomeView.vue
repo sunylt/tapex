@@ -1,69 +1,145 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { storeToRefs } from 'pinia'
 
-import { POD_CONFIG } from '@/pod/config'
+import { POD_CONFIG, STAKING_ENABLED } from '@/pod/config'
+import { formatToken, readNetworkStats, shortAddress } from '@/pod/service'
 import {
-  MOCK_CPU_SLICES,
-  MOCK_POOL_MINERS,
-  MOCK_POOL_OVERVIEW,
-  type PoolMiner,
-  type PoolMinerStatus,
-} from '@/pod/pool-mock'
-import { shortAddress } from '@/pod/service'
+  describeError,
+  readPoolStakes,
+  readVaultStats,
+  redeemMiner,
+  type VaultStats,
+} from '@/pod/tx'
+import type { NetworkStats, PoolStake } from '@/pod/types'
+import { useMiningStore } from '@/stores/mining'
 
-/* 全部数据来自 `@/pod/pool-mock`（模拟），接入链上后只需替换数据来源。 */
-const overview = MOCK_POOL_OVERVIEW
-const cpuSlices = MOCK_CPU_SLICES
-const miners = [...MOCK_POOL_MINERS].sort((a, b) => b.hashrate - a.hashrate)
+/* 全部数据来自链上：
+ *  在押矿机 = MinerDecomposer.stakedAt(index) + 每台的挖矿状态；
+ *  全网统计 = IMining.totalVerifWeight / dailyEmission / totalMined…；
+ *  金库与质押 = XTokenStaking.totalStaked + 金库 BEM 余额。 */
+const store = useMiningStore()
+const { connected, address, onCorrectChain } = storeToRefs(store)
 
-const symbol = overview.tokenSymbol
-const updatedText = new Date(overview.updatedAt).toLocaleTimeString()
+const stakes = ref<PoolStake[]>([])
+const network = ref<NetworkStats | null>(null)
+const vault = ref<VaultStats | null>(null)
+const loadingPool = ref(false)
+const poolError = ref<string | null>(null)
+const loadedAt = ref<number | null>(null)
+
+async function loadPool() {
+  if (loadingPool.value) return
+  loadingPool.value = true
+  poolError.value = null
+  try {
+    const [list, net, vaultStats] = await Promise.all([
+      readPoolStakes(),
+      readNetworkStats(),
+      readVaultStats(),
+    ])
+    stakes.value = list
+    network.value = net
+    vault.value = vaultStats
+    loadedAt.value = Date.now()
+  } catch (err) {
+    poolError.value = describeError(err)
+  } finally {
+    loadingPool.value = false
+  }
+}
 
 /* ---------------- 格式化 ---------------- */
 
-const fmtInt = (n: number) => Math.round(n).toLocaleString('en-US')
-const fmtBem = (n: number, frac = 2) =>
-  n.toLocaleString('en-US', { minimumFractionDigits: frac, maximumFractionDigits: frac })
+const symbol = POD_CONFIG.tokenSymbol
+
+const fmtBig = (n: bigint) => n.toLocaleString('en-US')
 const fmtPct = (r: number, frac = 2) => `${(r * 100).toFixed(frac)}%`
 const fmtArea = (n: number) =>
-  n >= 1_000_000 ? `${(n / 1_000_000).toFixed(2)}M` : n >= 1_000 ? `${(n / 1_000).toFixed(0)}K` : String(n)
+  n >= 1_000_000
+    ? `${(n / 1_000_000).toFixed(2)}M`
+    : n >= 1_000
+      ? `${(n / 1_000).toFixed(0)}K`
+      : String(n)
 
-/* ---------------- 状态 / 筛选 ---------------- */
+const updatedText = computed(() =>
+  loadedAt.value ? new Date(loadedAt.value).toLocaleTimeString() : '—',
+)
 
-const STATUS_LABEL: Record<PoolMinerStatus, string> = {
-  mining: '挖矿中',
-  idle: '空闲',
-  offline: '离线',
+/* ---------------- 汇总指标 ---------------- */
+
+/** 算力 = 链上 verifWeight + unverWeight（同量级，可直接相加）。 */
+const weightOf = (s: PoolStake): bigint =>
+  s.status ? s.status.verifWeight + s.status.unverWeight : 0n
+
+const networkWeight = computed(() =>
+  network.value ? network.value.totalVerifWeight + network.value.totalUnverWeight : 0n,
+)
+const poolWeight = computed(() => stakes.value.reduce((sum, s) => sum + weightOf(s), 0n))
+const share = computed(() => {
+  const net = networkWeight.value
+  return net === 0n ? 0 : Number(poolWeight.value) / Number(net)
+})
+
+/** 矿池预计日收益 = 全网日产出 × 矿池算力占比（bigint 精确计算）。 */
+const poolDaily = computed(() => {
+  const net = networkWeight.value
+  if (net === 0n || !network.value) return 0n
+  return (network.value.dailyEmission * poolWeight.value) / net
+})
+
+const miningCount = computed(() => stakes.value.filter((s) => s.status?.active).length)
+const idleCount = computed(() => stakes.value.length - miningCount.value)
+
+/** 矿池在押矿机待领收益之和（金库视角）。 */
+const poolPending = computed(() =>
+  stakes.value.reduce((sum, s) => sum + (s.status?.live ?? 0n), 0n),
+)
+
+const topWeight = computed(() => {
+  let max = 1n
+  for (const s of stakes.value) if (weightOf(s) > max) max = weightOf(s)
+  return max
+})
+
+/** 单台预计 24h 产出 = 矿池日收益 × 该台算力 / 矿池算力；空闲不产币。 */
+function output24h(s: PoolStake): bigint {
+  if (!s.status?.active || poolWeight.value === 0n) return 0n
+  return (poolDaily.value * weightOf(s)) / poolWeight.value
 }
 
-type FilterKey = 'all' | PoolMinerStatus
+const STATUS_LABEL: Record<'mining' | 'idle', string> = {
+  mining: '挖矿中',
+  idle: '空闲',
+}
+type RowStatus = keyof typeof STATUS_LABEL
 
-const filters: Array<{ key: FilterKey; label: string }> = [
+function statusOf(s: PoolStake): RowStatus {
+  return s.status?.active ? 'mining' : 'idle'
+}
+
+/* ---------------- 状态 / 筛选 / 分页 ---------------- */
+
+const filters = [
   { key: 'all', label: '全部' },
   { key: 'mining', label: '挖矿中' },
   { key: 'idle', label: '空闲' },
-  { key: 'offline', label: '离线' },
-]
+] as const
+
+type FilterKey = (typeof filters)[number]['key']
 
 const filter = ref<FilterKey>('all')
 
 const counts = computed<Record<FilterKey, number>>(() => ({
-  all: miners.length,
-  mining: miners.filter((m) => m.status === 'mining').length,
-  idle: miners.filter((m) => m.status === 'idle').length,
-  offline: miners.filter((m) => m.status === 'offline').length,
+  all: stakes.value.length,
+  mining: miningCount.value,
+  idle: idleCount.value,
 }))
 
 const filtered = computed(() =>
-  filter.value === 'all' ? miners : miners.filter((m) => m.status === filter.value),
+  filter.value === 'all' ? stakes.value : stakes.value.filter((s) => statusOf(s) === filter.value),
 )
 
-/* ---------------- 分页 ---------------- */
-/*
- * 目前是前端分页（数据只有演示用的十几条），但交互按「链上分页」设计：
- * 合约侧是 `stakedCount()` + `stakedAt(index)`，接入后把 `paged` 换成
- * 按 page/pageSize 拉一段索引即可，UI 不用动。
- */
 const pageSize = ref(10)
 const page = ref(1)
 
@@ -106,55 +182,90 @@ watch(pageCount, (total) => {
   if (page.value > total) page.value = total
 })
 
-const topHashrate = miners[0]?.hashrate ?? 1
+const nftUrl = (s: PoolStake) => `${POD_CONFIG.explorer}/nft/${s.cpu}/${s.id}`
 
-/** 该矿机占矿池算力的比例（真实百分比，表格里会写出来）。 */
-const poolShare = (m: PoolMiner) => m.hashrate / overview.poolHashrate
-/** 条形长度按列表内最大算力归一化，便于横向比较。 */
-const barWidth = (m: PoolMiner) => `${((m.hashrate / topHashrate) * 100).toFixed(1)}%`
+/** 算力构成（按 CPU 型号分组） */
+const cpuSlices = computed(() => {
+  const groups = new Map<string, { name: string; miners: number; weight: bigint }>()
+  for (const s of stakes.value) {
+    const g = groups.get(s.cpuName) ?? { name: s.cpuName, miners: 0, weight: 0n }
+    g.miners += 1
+    g.weight += weightOf(s)
+    groups.set(s.cpuName, g)
+  }
+  return [...groups.values()].sort((a, b) => (b.weight > a.weight ? 1 : -1))
+})
 
-const nftUrl = (m: PoolMiner) =>
-  `${POD_CONFIG.explorer}/nft/${POD_CONFIG.cpus[m.cpu]?.address ?? ''}/${m.circuitId}`
+const toneOf = (name: string) => {
+  const lower = name.toLowerCase()
+  if (lower.includes('behemoth')) return 'behemoth'
+  if (lower.includes('tapeout')) return 'tapeout'
+  return 'refbench'
+}
 
-const statusRows = computed(() => [
-  { key: 'mining' as const, label: '挖矿中', value: overview.mining },
-  { key: 'idle' as const, label: '空闲', value: overview.idle },
-  { key: 'offline' as const, label: '离线', value: overview.offline },
-])
+/* ---------------- 赎回（真实交易） ---------------- */
 
-/* ---------------- 赎回（模拟） ---------------- */
-
-const redeemTarget = ref<PoolMiner | null>(null)
+const redeemTarget = ref<PoolStake | null>(null)
+const redeemBusy = ref(false)
 const toast = ref<string | null>(null)
 let toastTimer: ReturnType<typeof setTimeout> | null = null
 
-function openRedeem(m: PoolMiner) {
-  redeemTarget.value = m
+function flash(message: string) {
+  toast.value = message
+  if (toastTimer) clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => (toast.value = null), 6000)
+}
+
+/** 赎回 = 烧掉价格数量的 xNAND / xLATCH，NFT 回到存款人钱包。 */
+const isMine = (s: PoolStake) =>
+  !!address.value && s.depositor.toLowerCase() === address.value.toLowerCase()
+
+function openRedeem(s: PoolStake) {
+  if (!isMine(s)) return
+  redeemTarget.value = s
 }
 
 function closeRedeem() {
   redeemTarget.value = null
 }
 
-function flash(message: string) {
-  toast.value = message
-  if (toastTimer) clearTimeout(toastTimer)
-  toastTimer = setTimeout(() => (toast.value = null), 3600)
-}
+async function confirmRedeem() {
+  const s = redeemTarget.value
+  if (!s) return
+  redeemTarget.value = null
 
-function confirmRedeem() {
-  const m = redeemTarget.value
-  if (!m) return
-  closeRedeem()
-  // 目前是纯前端模拟：不发交易，也不从列表里移除，方便反复评审设计。
-  flash(`已提交赎回：${m.cpu} #${m.circuitId}（模拟，未上链）`)
+  if (!connected.value) {
+    flash('请先连接钱包')
+    return
+  }
+  if (!onCorrectChain.value) {
+    flash('请先切换到 BNB Smart Chain（56）')
+    return
+  }
+  if (redeemBusy.value) return
+
+  redeemBusy.value = true
+  try {
+    const hash = await redeemMiner(s.cpu, s.id, s.nandAmount, s.latchAmount)
+    flash(`已赎回 ${s.cpuName} #${s.id}（${shortAddress(hash, 6)}）`)
+    await loadPool()
+    void store.refresh()
+  } catch (err) {
+    flash(describeError(err))
+  } finally {
+    redeemBusy.value = false
+  }
 }
 
 function onKeydown(event: KeyboardEvent) {
   if (event.key === 'Escape' && redeemTarget.value) closeRedeem()
 }
 
-onMounted(() => document.addEventListener('keydown', onKeydown))
+onMounted(() => {
+  document.addEventListener('keydown', onKeydown)
+  if (STAKING_ENABLED) void loadPool()
+})
+
 onBeforeUnmount(() => {
   document.removeEventListener('keydown', onKeydown)
   if (toastTimer) clearTimeout(toastTimer)
@@ -168,123 +279,159 @@ onBeforeUnmount(() => {
       <h1 class="title">
         TAPEX 矿池
         <span class="pill pill--live"><i class="pulse" />运行中</span>
-        <span class="tag-mock">模拟数据</span>
+        <a
+          v-if="POD_CONFIG.contracts.decomposer"
+          class="tag-mock mono"
+          :href="`${POD_CONFIG.explorer}/address/${POD_CONFIG.contracts.decomposer}`"
+          target="_blank"
+          rel="noopener"
+        >
+          拆解金库 {{ shortAddress(POD_CONFIG.contracts.decomposer) }}
+        </a>
       </h1>
       <p class="sub">
-        全网 PoD 算力池 · 结算币种 <b>{{ symbol }}</b> · 更新于
+        全网 PoD 算力池 · 结算币种 <b>{{ symbol }}</b> · 链上数据更新于
         <span class="mono">{{ updatedText }}</span>
+        <button class="refresh" type="button" :disabled="loadingPool" @click="loadPool()">
+          {{ loadingPool ? '读取中…' : '刷新' }}
+        </button>
       </p>
     </header>
+
+    <p v-if="!STAKING_ENABLED" class="warn">
+      未配置矿池合约地址（VITE_POD_DECOMPOSER 等），无法读取在押矿机。
+    </p>
+    <p v-else-if="poolError" class="error">读取失败：{{ poolError }}</p>
+    <p v-else-if="loadingPool && stakes.length === 0" class="empty">正在读取链上矿池数据…</p>
 
     <!-- 核心指标 ------------------------------------------------------ -->
     <section class="cards">
       <article class="card">
         <span class="card__label">全网算力</span>
-        <span class="card__value mono">{{ fmtInt(overview.networkHashrate) }}</span>
-        <span class="card__sub">全网 {{ fmtInt(overview.networkMiners) }} 台矿机</span>
+        <span class="card__value mono">{{ fmtBig(networkWeight) }}</span>
+        <span class="card__sub">全网 {{ network?.minerCount ?? '—' }} 台矿机</span>
       </article>
 
       <article class="card card--accent">
-        <span class="card__label">矿池算力</span>
-        <span class="card__value mono">{{ fmtInt(overview.poolHashrate) }}</span>
+        <span class="card__label">矿池算力（在押）</span>
+        <span class="card__value mono">{{ fmtBig(poolWeight) }}</span>
         <span class="card__sub">
-          占全网 <b class="pos">{{ fmtPct(overview.share) }}</b>
+          占全网 <b class="pos">{{ fmtPct(share) }}</b>
         </span>
-        <div class="bar bar--accent"><i :style="{ width: fmtPct(overview.share, 1) }" /></div>
+        <div class="bar bar--accent"><i :style="{ width: fmtPct(share, 1) }" /></div>
       </article>
 
       <article class="card">
         <span class="card__label">预计日收益</span>
-        <span class="card__value mono">{{ fmtBem(overview.poolDaily) }} <small>{{ symbol }}</small></span>
-        <span class="card__sub">全网日产 {{ fmtBem(overview.networkDaily, 0) }} {{ symbol }} × 占比</span>
+        <span class="card__value mono">
+          {{ formatToken(poolDaily) }} <small>{{ symbol }}</small>
+        </span>
+        <span class="card__sub">
+          全网日产 {{ network ? formatToken(network.dailyEmission, 0) : '—' }} {{ symbol }}
+        </span>
       </article>
 
       <article class="card">
-        <span class="card__label">24h 实际产出</span>
-        <span class="card__value mono">{{ fmtBem(overview.produced24h) }} <small>{{ symbol }}</small></span>
-        <span class="card__sub">在线率 {{ fmtPct(overview.uptime, 1) }}</span>
+        <span class="card__label">矿池待领收益</span>
+        <span class="card__value mono">
+          {{ formatToken(poolPending) }} <small>{{ symbol }}</small>
+        </span>
+        <span class="card__sub">在押 {{ stakes.length }} 台 · 挖矿中 {{ miningCount }}</span>
       </article>
     </section>
 
     <!-- 次级指标 ------------------------------------------------------ -->
     <section class="strip">
       <div class="strip__item">
-        <span class="strip__label">矿机总数</span>
-        <b class="mono">{{ fmtInt(overview.poolMiners) }}</b>
+        <span class="strip__label">在押矿机</span>
+        <b class="mono">{{ stakes.length }}</b>
       </div>
       <div class="strip__item">
         <span class="strip__label"><i class="dot dot--mining" />挖矿中</span>
-        <b class="mono">{{ fmtInt(overview.mining) }}</b>
+        <b class="mono">{{ miningCount }}</b>
       </div>
       <div class="strip__item">
         <span class="strip__label"><i class="dot dot--idle" />空闲</span>
-        <b class="mono">{{ fmtInt(overview.idle) }}</b>
+        <b class="mono">{{ idleCount }}</b>
       </div>
       <div class="strip__item">
-        <span class="strip__label"><i class="dot dot--offline" />离线</span>
-        <b class="mono">{{ fmtInt(overview.offline) }}</b>
+        <span class="strip__label">xNAND 抵押总量</span>
+        <b class="mono">{{ vault ? vault.nandStaked.toLocaleString('en-US') : '—' }}</b>
       </div>
       <div class="strip__item">
-        <span class="strip__label">单机日均</span>
+        <span class="strip__label">xLATCH 抵押总量</span>
+        <b class="mono">{{ vault ? vault.latchStaked.toLocaleString('en-US') : '—' }}</b>
+      </div>
+      <div class="strip__item">
+        <span class="strip__label">全网累计产出</span>
         <b class="mono"
-          >{{ fmtBem(overview.poolDaily / overview.poolMiners) }} {{ symbol }}</b
+          >{{ network ? formatToken(network.totalMined, 0) : '—' }} {{ symbol }}</b
         >
-      </div>
-      <div class="strip__item">
-        <span class="strip__label">累计产出</span>
-        <b class="mono">{{ fmtBem(overview.totalProduced) }} {{ symbol }}</b>
       </div>
     </section>
 
-    <!-- 构成 / 状态 ---------------------------------------------------- -->
+    <!-- 构成 / 金库 ---------------------------------------------------- -->
     <section class="panels">
       <article class="panel">
         <h2>算力构成</h2>
-        <div class="segbar">
+        <div v-if="cpuSlices.length" class="segbar">
           <i
             v-for="s in cpuSlices"
             :key="s.name"
-            :class="`tone-${s.tone}`"
-            :style="{ width: fmtPct(s.hashrate / overview.poolHashrate, 2) }"
-            :title="`${s.name} ${fmtPct(s.hashrate / overview.poolHashrate)}`"
+            :class="`tone-${toneOf(s.name)}`"
+            :style="{
+              width: fmtPct(
+                poolWeight === 0n ? 0 : Number(s.weight) / Number(poolWeight),
+                2,
+              ),
+            }"
+            :title="`${s.name} ${fmtBig(s.weight)}`"
           />
         </div>
         <ul class="legend">
           <li v-for="s in cpuSlices" :key="s.name">
-            <i class="swatch" :class="`tone-${s.tone}`" />
+            <i class="swatch" :class="`tone-${toneOf(s.name)}`" />
             <span class="legend__name">{{ s.name }}</span>
-            <span class="legend__miners">{{ fmtInt(s.miners) }} 台</span>
-            <b class="mono">{{ fmtInt(s.hashrate) }}</b>
-            <span class="legend__pct mono">{{ fmtPct(s.hashrate / overview.poolHashrate) }}</span>
+            <span class="legend__miners">{{ s.miners }} 台</span>
+            <b class="mono">{{ fmtBig(s.weight) }}</b>
+            <span class="legend__pct mono">{{
+              fmtPct(poolWeight === 0n ? 0 : Number(s.weight) / Number(poolWeight))
+            }}</span>
           </li>
         </ul>
+        <p v-if="cpuSlices.length === 0" class="panel__empty">矿池里还没有在押矿机。</p>
         <p class="panel__foot">
-          合计 <b>{{ fmtInt(overview.poolHashrate) }}</b> · {{ cpuSlices.length }} 种 CPU 型号
+          合计 <b>{{ fmtBig(poolWeight) }}</b> · {{ cpuSlices.length }} 种 CPU 型号
         </p>
       </article>
 
       <article class="panel">
-        <h2>矿机状态</h2>
-        <div class="segbar segbar--status">
-          <i
-            v-for="row in statusRows"
-            :key="row.key"
-            :class="`tone-${row.key}`"
-            :style="{ width: fmtPct(row.value / overview.poolMiners, 2) }"
-            :title="`${row.label} ${fmtInt(row.value)} 台`"
-          />
-        </div>
+        <h2>金库与质押池</h2>
         <ul class="statuslist">
-          <li v-for="row in statusRows" :key="row.key">
-            <span class="statuslist__label">
-              <i class="dot" :class="`dot--${row.key}`" />{{ row.label }}
-            </span>
-            <b class="mono">{{ fmtInt(row.value) }}</b>
-            <span class="statuslist__pct mono">{{ fmtPct(row.value / overview.poolMiners, 1) }}</span>
+          <li>
+            <span class="statuslist__label">在押矿机</span>
+            <b class="mono">{{ vault ? vault.stakedCount : '—' }}</b>
+            <span class="statuslist__pct mono">台</span>
+          </li>
+          <li>
+            <span class="statuslist__label">金库余额</span>
+            <b class="mono">{{ vault ? formatToken(vault.vaultBalance) : '—' }}</b>
+            <span class="statuslist__pct mono">{{ symbol }}</span>
+          </li>
+          <li>
+            <span class="statuslist__label">已保留未发放</span>
+            <b class="mono">{{ vault ? formatToken(vault.reserved) : '—' }}</b>
+            <span class="statuslist__pct mono">{{ symbol }}</span>
+          </li>
+          <li>
+            <span class="statuslist__label">可发放</span>
+            <b class="mono">{{ vault ? formatToken(vault.free) : '—' }}</b>
+            <span class="statuslist__pct mono">{{ symbol }}</span>
           </li>
         </ul>
         <p class="panel__foot">
-          矿池平均在线率 <b>{{ fmtPct(overview.uptime, 1) }}</b> · 离线矿机不产币
+          xNAND {{ vault ? vault.nandStaked.toLocaleString('en-US') : '—' }} · xLATCH
+          {{ vault ? vault.latchStaked.toLocaleString('en-US') : '—' }}（质押池总量）
         </p>
       </article>
     </section>
@@ -293,10 +440,8 @@ onBeforeUnmount(() => {
     <section class="miners">
       <div class="miners__bar">
         <h2>
-          矿池矿机
-          <small>
-            按算力降序 · 矿池共 {{ fmtInt(overview.poolMiners) }} 台（当前为 {{ miners.length }} 条演示数据）
-          </small>
+          在押矿机
+          <small>来自 MinerDecomposer.stakedAt · 共 {{ stakes.length }} 台</small>
         </h2>
         <div class="filters">
           <button
@@ -324,40 +469,73 @@ onBeforeUnmount(() => {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="m in paged" :key="m.id">
+            <tr v-for="s in paged" :key="`${s.cpu}-${s.id}`">
               <td data-label="电路名字">
-                <a class="name" :href="nftUrl(m)" target="_blank" rel="noopener">
-                  <span class="cpu">{{ m.cpu }}</span>
-                  <span class="mono">#{{ m.circuitId }}</span>
+                <a class="name" :href="nftUrl(s)" target="_blank" rel="noopener">
+                  <span class="cpu">{{ s.cpuName }}</span>
+                  <span class="mono">#{{ s.id }}</span>
                 </a>
-                <span class="meta mono">{{ shortAddress(m.owner) }}</span>
+                <span class="meta mono">存入方 {{ shortAddress(s.depositor) }}</span>
               </td>
               <td data-label="结构">
-                <span class="strong mono">{{ fmtInt(m.gates) }} 门 · 深度 {{ m.depth }}</span>
-                <span class="meta mono">{{ fmtInt(m.states) }} 态 · 面积 {{ fmtArea(m.area) }}</span>
+                <template v-if="s.status">
+                  <span class="strong mono">
+                    {{ s.status.gateCount.toLocaleString('en-US') }} 门 · 深度
+                    {{ s.status.depth }}
+                  </span>
+                  <span class="meta mono">
+                    {{ s.status.stateCount.toLocaleString('en-US') }} 态 · 面积
+                    {{ fmtArea(Number(s.status.area)) }}
+                  </span>
+                </template>
+                <span v-else class="strong muted">读取失败</span>
               </td>
               <td data-label="状态">
-                <span class="pill" :class="`pill--${m.status}`">
-                  <i class="dot" :class="`dot--${m.status}`" />{{ STATUS_LABEL[m.status] }}
+                <span class="pill" :class="`pill--${statusOf(s)}`">
+                  <i class="dot" :class="`dot--${statusOf(s)}`" />{{ STATUS_LABEL[statusOf(s)] }}
                 </span>
-                <span class="meta">在线率 {{ m.uptime.toFixed(2) }}%</span>
+                <span class="meta"
+                  >赎回价 xNAND {{ s.nandAmount.toLocaleString('en-US') }} · xLATCH
+                  {{ s.latchAmount.toLocaleString('en-US') }}</span
+                >
               </td>
               <td class="num" data-label="算力">
-                <b class="mono">{{ fmtInt(m.hashrate) }}</b>
-                <span class="meta mono">占矿池 {{ fmtPct(poolShare(m), 2) }}</span>
-                <div class="bar bar--thin"><i :style="{ width: barWidth(m) }" /></div>
+                <b class="mono">{{ fmtBig(weightOf(s)) }}</b>
+                <span class="meta mono"
+                  >占矿池{{
+                    fmtPct(poolWeight === 0n ? 0 : Number(weightOf(s)) / Number(poolWeight), 2)
+                  }}</span
+                >
+                <div class="bar bar--thin">
+                  <i
+                    :style="{
+                      width: `${((Number(weightOf(s)) / Number(topWeight)) * 100).toFixed(1)}%`,
+                    }"
+                  />
+                </div>
               </td>
               <td class="num" data-label="预计 24h 产出">
-                <b v-if="m.output24h > 0" class="mono pos">{{ fmtBem(m.output24h) }}</b>
+                <b v-if="output24h(s) > 0n" class="mono pos">{{ formatToken(output24h(s)) }}</b>
                 <b v-else class="muted">—</b>
-                <span class="meta">{{ m.output24h > 0 ? symbol : '未在挖矿' }}</span>
+                <span class="meta">{{ output24h(s) > 0n ? symbol : '未在挖矿' }}</span>
               </td>
               <td class="action" data-label="操作">
-                <button class="redeem" type="button" @click="openRedeem(m)">赎回</button>
+                <button
+                  v-if="isMine(s)"
+                  class="redeem"
+                  type="button"
+                  :disabled="redeemBusy"
+                  @click="openRedeem(s)"
+                >
+                  赎回
+                </button>
+                <span v-else class="meta">非本人存入</span>
               </td>
             </tr>
             <tr v-if="paged.length === 0">
-              <td class="empty" colspan="6">该状态下暂无矿机。</td>
+              <td class="empty" colspan="6">
+                {{ loadingPool ? '读取中…' : '矿池里还没有在押矿机。' }}
+              </td>
             </tr>
           </tbody>
         </table>
@@ -409,60 +587,76 @@ onBeforeUnmount(() => {
       </div>
 
       <p class="hint">
-        预计产出 = 矿池预计日收益 × 该矿机算力 ÷ 矿池算力；空闲 / 离线矿机不产币。当前为<strong
-          >模拟数据</strong
-        >，待接入链上后自动替换。
+        预计产出 = 矿池预计日收益 × 该矿机算力 ÷ 矿池算力；空闲矿机不产币。
+        赎回会烧掉钱包里相同数量的 xNAND / xLATCH（数量不足时请先在「我的」页解押）。
       </p>
     </section>
 
-    <!-- 赎回确认（模拟） --------------------------------------------- -->
+    <!-- 赎回确认（链上交易） ----------------------------------------- -->
     <Teleport to="body">
       <div v-if="redeemTarget" class="overlay" @click.self="closeRedeem">
         <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="redeem-title">
           <h3 id="redeem-title">赎回矿机</h3>
           <p class="dialog__lead">
             即将赎回
-            <b>{{ redeemTarget.cpu }} #{{ redeemTarget.circuitId }}</b>
+            <b>{{ redeemTarget.cpuName }} #{{ redeemTarget.id }}</b>
           </p>
 
           <dl class="dialog__grid">
             <div>
               <dt>结构</dt>
-              <dd class="mono">
-                {{ fmtInt(redeemTarget.gates) }} 门 · 深度 {{ redeemTarget.depth }}
+              <dd v-if="redeemTarget.status" class="mono">
+                {{ redeemTarget.status.gateCount.toLocaleString('en-US') }} 门 · 深度
+                {{ redeemTarget.status.depth }}
               </dd>
+              <dd v-else class="muted">—</dd>
             </div>
             <div>
               <dt>算力</dt>
-              <dd class="mono">{{ fmtInt(redeemTarget.hashrate) }}</dd>
+              <dd class="mono">{{ fmtBig(weightOf(redeemTarget)) }}</dd>
             </div>
             <div>
-              <dt>预计 24h 产出</dt>
+              <dt>待领收益</dt>
               <dd class="mono">
-                {{ redeemTarget.output24h > 0 ? `${fmtBem(redeemTarget.output24h)} ${symbol}` : '—' }}
+                {{
+                  redeemTarget.status && redeemTarget.status.live > 0n
+                    ? `${formatToken(redeemTarget.status.live)} ${symbol}`
+                    : '—'
+                }}
               </dd>
             </div>
             <div>
               <dt>状态</dt>
               <dd>
-                <span class="pill" :class="`pill--${redeemTarget.status}`">
-                  <i class="dot" :class="`dot--${redeemTarget.status}`" />{{
-                    STATUS_LABEL[redeemTarget.status]
+                <span class="pill" :class="`pill--${statusOf(redeemTarget)}`">
+                  <i class="dot" :class="`dot--${statusOf(redeemTarget)}`" />{{
+                    STATUS_LABEL[statusOf(redeemTarget)]
                   }}
                 </span>
               </dd>
             </div>
           </dl>
 
-          <p class="dialog__warn">
-            赎回后该矿机将退出矿池并停止产出，操作不可撤销。
-            <span v-if="redeemTarget.status === 'mining'">该矿机当前正在挖矿，赎回会立即中断本轮产出。</span>
+          <p class="dialog__cost">
+            赎回价格：烧毁
+            <b class="mono">{{ redeemTarget.nandAmount.toLocaleString('en-US') }}</b> xNAND +
+            <b class="mono">{{ redeemTarget.latchAmount.toLocaleString('en-US') }}</b> xLATCH，
+            需先在「我的」页解押到钱包。
           </p>
-          <p class="dialog__mock">当前为模拟数据，点击确认不会发起链上交易。</p>
+          <p class="dialog__warn">
+            赎回后 NFT 转回你的钱包，矿机退出矿池；矿机上未领取的收益归矿池所有，操作不可撤销。
+          </p>
 
           <div class="dialog__actions">
             <button class="btn btn--ghost" type="button" @click="closeRedeem">取消</button>
-            <button class="btn btn--danger" type="button" @click="confirmRedeem">确认赎回</button>
+            <button
+              class="btn btn--danger"
+              type="button"
+              :disabled="redeemBusy"
+              @click="confirmRedeem"
+            >
+              {{ redeemBusy ? '提交中…' : '确认赎回' }}
+            </button>
           </div>
         </div>
       </div>
@@ -499,6 +693,48 @@ onBeforeUnmount(() => {
   opacity: 0.7;
 }
 
+.refresh {
+  margin-left: 10px;
+  padding: 3px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    border-color 0.2s,
+    background-color 0.2s;
+}
+
+.refresh:hover:not(:disabled) {
+  border-color: var(--color-border-hover);
+  background: var(--color-background-mute);
+}
+
+.refresh:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.warn,
+.error {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.warn {
+  background: hsla(45, 100%, 50%, 0.15);
+}
+
+.error {
+  background: hsla(0, 80%, 50%, 0.15);
+  color: hsla(0, 80%, 40%, 1);
+}
+
 .tag-mock {
   padding: 3px 9px;
   border: 1px dashed var(--color-border-hover);
@@ -507,6 +743,11 @@ onBeforeUnmount(() => {
   font-weight: 500;
   letter-spacing: 0.02em;
   opacity: 0.75;
+  text-decoration: none;
+}
+
+.tag-mock:hover {
+  opacity: 1;
 }
 
 .pill {
@@ -774,6 +1015,12 @@ onBeforeUnmount(() => {
   border-top: 1px solid var(--color-border);
   font-size: 12.5px;
   opacity: 0.62;
+}
+
+.panel__empty {
+  margin: 14px 0 0;
+  font-size: 13px;
+  opacity: 0.6;
 }
 
 .panel__foot b {
@@ -1250,7 +1497,7 @@ onBeforeUnmount(() => {
 }
 
 .dialog__warn {
-  margin: 0 0 8px;
+  margin: 0 0 20px;
   font-size: 13px;
   line-height: 1.6;
 }
@@ -1260,10 +1507,19 @@ onBeforeUnmount(() => {
   color: hsla(0, 70%, 48%, 1);
 }
 
-.dialog__mock {
-  margin: 0 0 20px;
-  font-size: 12px;
-  opacity: 0.55;
+.dialog__cost {
+  margin: 0 0 8px;
+  padding: 10px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-background);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.dialog__cost b {
+  color: var(--color-heading);
+  font-variant-numeric: tabular-nums;
 }
 
 .dialog__actions {

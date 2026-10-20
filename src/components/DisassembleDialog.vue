@@ -5,7 +5,7 @@ import { shortAddress } from '@/pod/service'
 import type { MinerStatus } from '@/pod/types'
 
 /**
- * 拆解确认弹窗（纯交互，未接链上）。
+ * 拆解确认弹窗（确认后发真实交易：MinerDecomposer.stake）。
  *
  * 与 MinerDecomposer 合约对齐：
  *  - 铸造数量 = `nandBurn × mult` / `latchBurn × mult`（不是裸的 nandBurn！）
@@ -97,6 +97,9 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKeydown))
         </p>
         <p class="warn warn--hint">
           建议先领取这台矿机的当前收益：拆解后矿机归矿池，未领取的收益也会一并归矿池所有。
+        </p>
+        <p class="warn warn--hint">
+          确认后钱包会先请求 NFT 授权（MinerDecomposer.approve），再提交拆解交易。
         </p>
 
         <div class="actions">
@@ -270,23 +273,18 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKeydown))
 }
 
 .warn--hint {
-  margin: 10px 0 20px;
+  margin: 10px 0 6px;
   padding: 9px 12px;
   border-radius: 10px;
   background: hsla(45, 100%, 50%, 0.13);
   font-size: 12.5px;
 }
 
-.mock {
-  margin: 0 0 20px;
-  font-size: 12px;
-  opacity: 0.55;
-}
-
 .actions {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+  margin-top: 16px;
 }
 
 .btn {
