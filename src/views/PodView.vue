@@ -5,10 +5,18 @@ import { storeToRefs } from 'pinia'
 import DisassembleDialog from '@/components/DisassembleDialog.vue'
 import MinerCard from '@/components/MinerCard.vue'
 import StakeDialog from '@/components/StakeDialog.vue'
-import { POD_CONFIG } from '@/pod/config'
-import { MOCK_MY_EQUITY, type EquityToken } from '@/pod/pool-mock'
+import { POD_CONFIG, STAKING_ENABLED } from '@/pod/config'
 import { formatToken, hasInjectedWallet, shortAddress } from '@/pod/service'
-import type { MinerStatus } from '@/pod/types'
+import {
+  claimMiningRewards,
+  claimStakingRewards,
+  describeError,
+  distributeAllRewards,
+  stakeMiner,
+  stakeX,
+  unstakeX,
+} from '@/pod/tx'
+import type { EquityToken, MinerStatus } from '@/pod/types'
 import { useMiningStore } from '@/stores/mining'
 
 const store = useMiningStore()
@@ -25,16 +33,14 @@ const {
   onCorrectChain,
   activeCount,
   totalLive,
+  equity,
+  earned,
+  equityLoaded,
+  isPoolOwner,
 } = storeToRefs(store)
 
 const walletAvailable = hasInjectedWallet()
 const tokenSymbol = POD_CONFIG.tokenSymbol
-
-/* 矿池权益：xNAND / xLATCH 目前是模拟数据，接入链上后换成持仓 / 质押查询结果。
-   当前收益用的是链上真实值（矿机待领取之和 totalLive）。
-   这里拷贝一份 mock，抵押 / 解押确认后直接改这份数据，用来模拟链上状态变化
-   （刷新页面或重新进入本页会回到初始值）。 */
-const equity = ref<EquityToken[]>(MOCK_MY_EQUITY.map((t) => ({ ...t })))
 
 /** 矿池占比 = 我的质押量 ÷ 矿池质押总量 */
 const poolShare = (t: EquityToken) => (t.poolStaked === 0 ? 0 : t.staked / t.poolStaked)
@@ -50,7 +56,9 @@ const scanText = computed(() => {
   return `正在扫描链上历史… ${p.done}/${p.total}`
 })
 
-/* ---------------- 弹窗 / 提示 ---------------- */
+/* ---------------- 链上交易 ---------------- */
+
+const busy = ref<string | null>(null)
 
 const disassembleTarget = ref<MinerStatus | null>(null)
 const toast = ref<string | null>(null)
@@ -59,11 +67,49 @@ let toastTimer: ReturnType<typeof setTimeout> | null = null
 function flash(message: string) {
   toast.value = message
   if (toastTimer) clearTimeout(toastTimer)
-  toastTimer = setTimeout(() => (toast.value = null), 4200)
+  toastTimer = setTimeout(() => (toast.value = null), 6000)
 }
 
+/** 交易前置检查：已连接钱包、链正确、没有正在进行的交易。 */
+function guardChain(): boolean {
+  if (!connected.value) {
+    flash('请先连接钱包')
+    return false
+  }
+  if (!onCorrectChain.value) {
+    flash('请先切换到 BNB Smart Chain（56）')
+    return false
+  }
+  if (busy.value) return false
+  return true
+}
+
+async function run(
+  label: string,
+  fn: () => Promise<string>,
+  ok: (hash: string) => string,
+) {
+  if (!guardChain()) return
+  busy.value = label
+  try {
+    const hash = await fn()
+    flash(`${ok(hash)}（${shortAddress(hash, 6)}）`)
+    await store.refresh()
+  } catch (err) {
+    flash(describeError(err))
+  } finally {
+    busy.value = null
+  }
+}
+
+/* ---------------- 拆解（质押矿机进矿池） ---------------- */
+
 function openDisassemble(miner: MinerStatus) {
-  // 兜底：该型号没开放质押就不弹窗（卡片上的按钮本身也会置灰）
+  if (!guardChain()) return
+  if (!STAKING_ENABLED) {
+    flash('未配置拆解合约地址（VITE_POD_DECOMPOSER）')
+    return
+  }
   if (!POD_CONFIG.cpus[miner.ref.cpu]?.stakeEnabled) return
   disassembleTarget.value = miner
 }
@@ -74,24 +120,56 @@ function closeDisassemble() {
 
 function confirmDisassemble(miner: MinerStatus) {
   disassembleTarget.value = null
-  // 纯交互演示：不发交易，也不改动列表，方便反复评审设计。
-  // 数量与 MinerDecomposer 一致：nandBurn / latchBurn 都要乘 mult。
-  const { cpu, circuitId } = miner.ref
+  const { circuits, circuitId } = miner.ref
   const mult = miner.mult || 1
-  flash(
-    `已提交拆解：${cpu} #${circuitId} · 铸造 xNAND ${(miner.nandBurn * mult).toLocaleString(
-      'en-US',
-    )} / xLATCH ${(miner.latchBurn * mult).toLocaleString('en-US')}`,
+  void run(
+    'stake-miner',
+    () => stakeMiner(circuits, circuitId),
+    () =>
+      `已拆解 ${miner.ref.cpu} #${circuitId}：铸造 xNAND ${(
+        miner.nandBurn * mult
+      ).toLocaleString('en-US')} / xLATCH ${(miner.latchBurn * mult).toLocaleString('en-US')}`,
   )
 }
 
-/** 领取当前收益（交互演示，未接链上）。 */
-function claim() {
-  if (totalLive.value === 0n) return
-  flash(`已提交领取 ${formatToken(totalLive.value)} ${tokenSymbol}`)
+/* ---------------- 领取收益 ---------------- */
+
+/** 矿机收益：claimMany(全部挖矿中的矿机 key)，打进当前 NFT 持有人 = 钱包。 */
+function claimMining() {
+  const keys = miners.value.filter((m) => m.active).map((m) => m.key)
+  if (keys.length === 0) return
+  void run(
+    'claim-mining',
+    () => claimMiningRewards(keys),
+    () => `已提交领取矿机收益 ${formatToken(totalLive.value)} ${tokenSymbol}`,
+  )
 }
 
-/* ---------------- 抵押 / 解押（交互演示，未接链上） ---------------- */
+/** 质押收益：XTokenStaking.claim()，金库直付给钱包。 */
+function claimStaking() {
+  void run(
+    'claim-staking',
+    () => claimStakingRewards(),
+    () => `已提交领取质押收益 ${formatToken(earned.value)} ${tokenSymbol}`,
+  )
+}
+
+/** Owner 专属：把金库可用 BEM 全部分给质押池。 */
+async function distribute() {
+  if (!guardChain()) return
+  busy.value = 'distribute'
+  try {
+    const { hash, amount } = await distributeAllRewards()
+    flash(`已发放 ${formatToken(amount)} ${tokenSymbol} 给质押池（${shortAddress(hash, 6)}）`)
+    await store.refresh()
+  } catch (err) {
+    flash(describeError(err))
+  } finally {
+    busy.value = null
+  }
+}
+
+/* ---------------- 抵押 / 解押 xNAND / xLATCH ---------------- */
 
 const stakeToken = ref<EquityToken | null>(null)
 const stakeMode = ref<'stake' | 'unstake'>('stake')
@@ -111,32 +189,13 @@ function confirmStake(payload: {
   amount: number
 }) {
   stakeToken.value = null
-  const action = payload.mode === 'stake' ? '抵押' : '解押'
-  const amountText = payload.amount.toLocaleString('en-US')
-
-  // 模拟链上效果：钱包余额与质押量对调，矿池质押总量同步增减，
-  // 因此「矿池占比」也会一起变。
-  const item = equity.value.find((t) => t.symbol === payload.token.symbol)
-  if (!item) {
-    flash(`已提交${action} ${amountText} ${payload.token.symbol}`)
-    return
-  }
-
-  const before = poolShare(item)
-  if (payload.mode === 'stake') {
-    item.held = Math.max(0, item.held - payload.amount)
-    item.staked += payload.amount
-    item.poolStaked += payload.amount
-  } else {
-    item.staked = Math.max(0, item.staked - payload.amount)
-    item.held += payload.amount
-    item.poolStaked = Math.max(0, item.poolStaked - payload.amount)
-  }
-
-  flash(
-    `已${action} ${amountText} ${item.symbol} · 矿池占比 ${pctText(before)} → ${pctText(
-      poolShare(item),
-    )}`,
+  const { token, mode, amount } = payload
+  const label = mode === 'stake' ? '抵押' : '解押'
+  const send = mode === 'stake' ? stakeX : unstakeX
+  void run(
+    `x-${mode}`,
+    () => send(token.address, amount),
+    () => `已${label} ${amount.toLocaleString('en-US')} ${token.symbol}`,
   )
 }
 
@@ -176,13 +235,25 @@ onBeforeUnmount(() => {
     <p v-if="error" class="error">{{ error }}</p>
 
     <!-- 矿池权益 ------------------------------------------------------ -->
-    <section v-if="connected" class="equity">
+    <section v-if="connected && STAKING_ENABLED" class="equity">
       <div class="section__bar">
         <h2>矿池权益</h2>
-        <span class="tag-mock">xNAND / xLATCH 为模拟数据</span>
+        <span class="tag-mock">
+          拆解金库
+          <a
+            class="mono"
+            :href="`${POD_CONFIG.explorer}/address/${POD_CONFIG.contracts.decomposer}`"
+            target="_blank"
+            rel="noopener"
+          >
+            {{ shortAddress(POD_CONFIG.contracts.decomposer ?? '') }}
+          </a>
+        </span>
       </div>
 
-      <article class="equity__card">
+      <p v-if="!equityLoaded" class="empty">正在读取 xNAND / xLATCH 链上余额…</p>
+
+      <article v-else class="equity__card">
         <div class="equity__list">
           <div v-for="t in equity" :key="t.symbol" class="equity__item">
             <span class="equity__symbol">{{ t.symbol }}</span>
@@ -193,7 +264,7 @@ onBeforeUnmount(() => {
             </div>
 
             <div class="equity__cell">
-              <span class="equity__label">已质押</span>
+              <span class="equity__label">已抵押</span>
               <b class="equity__value mono">{{ t.staked.toLocaleString('en-US') }}</b>
             </div>
 
@@ -208,7 +279,7 @@ onBeforeUnmount(() => {
               <button
                 class="mini"
                 type="button"
-                :disabled="t.held === 0"
+                :disabled="t.held === 0 || !!busy"
                 @click="openStake(t, 'stake')"
               >
                 抵押
@@ -216,7 +287,7 @@ onBeforeUnmount(() => {
               <button
                 class="mini mini--ghost"
                 type="button"
-                :disabled="t.staked === 0"
+                :disabled="t.staked === 0 || !!busy"
                 @click="openStake(t, 'unstake')"
               >
                 解押
@@ -227,14 +298,45 @@ onBeforeUnmount(() => {
 
         <footer class="equity__foot">
           <div class="equity__cell">
-            <span class="equity__label">矿池收益</span>
+            <span class="equity__label">矿机待领（claimMany）</span>
             <b class="equity__earn mono">
               {{ formatToken(totalLive) }} <small>{{ tokenSymbol }}</small>
             </b>
           </div>
 
-          <button class="claim" type="button" :disabled="totalLive === 0n" @click="claim">
+          <button
+            class="claim"
+            type="button"
+            :disabled="totalLive === 0n || !!busy"
+            @click="claimMining"
+          >
             领取
+          </button>
+
+          <div class="equity__cell">
+            <span class="equity__label">质押待领（XTokenStaking.claim）</span>
+            <b class="equity__earn mono">
+              {{ formatToken(earned) }} <small>{{ tokenSymbol }}</small>
+            </b>
+          </div>
+
+          <button
+            class="claim"
+            type="button"
+            :disabled="earned === 0n || !!busy"
+            @click="claimStaking"
+          >
+            领取
+          </button>
+        </footer>
+
+        <footer v-if="isPoolOwner" class="equity__foot equity__foot--owner">
+          <div class="equity__cell">
+            <span class="equity__label">Owner 操作</span>
+            <b class="owner-hint">把金库可用收益全部发放给质押池（distributeRewards）</b>
+          </div>
+          <button class="claim claim--owner" type="button" :disabled="!!busy" @click="distribute">
+            发放收益
           </button>
         </footer>
       </article>
@@ -467,6 +569,21 @@ button:disabled {
   justify-content: space-between;
   gap: 16px;
   padding: 15px 0 16px;
+  flex-wrap: wrap;
+}
+.equity__foot--owner {
+  border-top: 1px dashed var(--color-border);
+}
+.owner-hint {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-heading);
+}
+.claim--owner {
+  background: hsla(210, 90%, 48%, 1);
+}
+.claim--owner:hover:not(:disabled) {
+  background: hsla(210, 90%, 42%, 1);
 }
 .equity__earn {
   font-size: 24px;

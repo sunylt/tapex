@@ -16,6 +16,12 @@ export interface PodContracts {
   lensNext?: string
   token: string
   factory?: string
+  /** MinerDecomposer（拆解 / 赎回金库）。未部署时为空串，相关按钮会禁用。 */
+  decomposer?: string
+  /** XTokenStaking（xNAND / xLATCH 质押池） */
+  staking?: string
+  xNand?: string
+  xLatch?: string
 }
 
 export interface PodConfig {
@@ -37,6 +43,36 @@ export interface MinerRef {
   circuitId: number
   taskId: number
   note?: string
+}
+
+/** xNAND / xLATCH 权益（decimals = 0，数量即整数枚数）。 */
+export interface EquityToken {
+  /** 展示用符号，如 `xNAND` */
+  symbol: string
+  /** 代币合约地址（发交易用） */
+  address: string
+  /** 钱包持有 */
+  held: number
+  /** 已质押进质押池 */
+  staked: number
+  /** 质押池总量（算占比用） */
+  poolStaked: number
+}
+
+/** 矿池里的一台在押矿机（`MinerDecomposer.stakedAt(index)`）。 */
+export interface PoolStake {
+  /** CPU NFT 合约地址 */
+  cpu: string
+  /** CPU 型号名（对应 `POD_CONFIG.cpus` 的 key），未知型号回退为地址 */
+  cpuName: string
+  id: number
+  /** 拆解时的存款人 */
+  depositor: string
+  /** 赎回需要烧掉的 xNAND / xLATCH 数量 */
+  nandAmount: number
+  latchAmount: number
+  /** 链上矿机状态；读取失败时为 null */
+  status: MinerStatus | null
 }
 
 export interface MinerPreview {
@@ -79,6 +115,8 @@ export interface NetworkStats {
   totalVerifWeight: bigint
   totalUnverWeight: bigint
   currentRate: bigint
+  /** 全网日产出（BEM，8 decimals） */
+  dailyEmission: bigint
   minerCount: number
   verifMinerCount: number
   unverifiedBps: number

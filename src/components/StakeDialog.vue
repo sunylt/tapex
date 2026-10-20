@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
-import type { EquityToken } from '@/pod/pool-mock'
+import type { EquityToken } from '@/pod/types'
 
 /**
- * 抵押 / 解押弹窗（纯交互，未接链上）。
+ * 抵押 / 解押弹窗（真实交易：XTokenStaking.stake / unstake）。
  *
  * 抵押 = 把钱包里的 xNAND / xLATCH 质押进 TAPEX 矿池
  * 解押 = 从矿池取回已质押的数量
+ *
+ * xNAND / xLATCH 的 decimals = 0，所以数量只能是整数。
  */
 const props = defineProps<{
   /** 为 null 时不显示弹窗 */
@@ -32,12 +34,12 @@ const max = computed(() => (isStake.value ? (props.token?.held ?? 0) : (props.to
 
 const value = computed(() => {
   const n = Number(amount.value)
-  return Number.isFinite(n) && n > 0 ? n : 0
+  return Number.isSafeInteger(n) && n > 0 ? n : 0
 })
 const tooMuch = computed(() => value.value > max.value)
 const canSubmit = computed(() => value.value > 0 && !tooMuch.value)
 
-const fmt = (n: number) => n.toLocaleString('en-US', { maximumFractionDigits: 4 })
+const fmt = (n: number) => n.toLocaleString('en-US')
 
 const afterHeld = computed(() => {
   if (!props.token) return 0
@@ -51,14 +53,13 @@ const afterStaked = computed(() => {
 const ratios = [0.25, 0.5, 0.75, 1]
 
 function setRatio(r: number) {
-  amount.value = String(Number((max.value * r).toFixed(4)))
+  amount.value = String(Math.floor(max.value * r))
 }
 
 function onAmountInput(event: Event) {
   const el = event.target as HTMLInputElement
-  let next = el.value.replace(/[^\d.]/g, '')
-  const dot = next.indexOf('.')
-  if (dot !== -1) next = next.slice(0, dot + 1) + next.slice(dot + 1).replace(/\./g, '')
+  // decimals = 0：只允许整数
+  const next = el.value.replace(/\D/g, '')
   amount.value = next
   if (el.value !== next) el.value = next
 }
@@ -110,8 +111,8 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKeydown))
               ref="inputEl"
               class="field__input mono"
               type="text"
-              inputmode="decimal"
-              placeholder="0.00"
+              inputmode="numeric"
+              placeholder="0"
               :value="amount"
               @input="onAmountInput"
             />
@@ -152,7 +153,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKeydown))
           </div>
         </dl>
 
-        <p class="mock">当前为交互演示，点击确认不会发起链上交易。</p>
+        <p class="hint">确认后钱包会依次请求授权（额度不足时）与{{ actionText }}两笔交易。</p>
 
         <div class="actions">
           <button class="btn btn--ghost" type="button" @click="emit('close')">取消</button>
@@ -354,7 +355,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKeydown))
   opacity: 0.45;
 }
 
-.mock {
+.hint {
   margin: 12px 0 20px;
   font-size: 12px;
   opacity: 0.55;

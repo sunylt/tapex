@@ -4,8 +4,8 @@ import * as dotenv from 'dotenv'
 
 dotenv.config()
 
-console.log('BSC_RPC:', process.env.BSC_RPC)
-console.log('PRIVATE_KEY:', process.env.PRIVATE_KEY)
+const forkUrl = process.env.FORK_RPC
+const forkBlock = process.env.FORK_BLOCK ? Number(process.env.FORK_BLOCK) : undefined
 
 const config: HardhatUserConfig = {
   solidity: {
@@ -16,6 +16,11 @@ const config: HardhatUserConfig = {
     },
   },
   networks: {
+    hardhat: {
+      // 与前端 / MetaMask 的 BSC 链 ID 保持一致（POD_CONFIG.chainId = 56）
+      chainId: 56,
+      ...(forkUrl ? { forking: { url: forkUrl, blockNumber: forkBlock } } : {}),
+    },
     bsc: {
       url: process.env.BSC_RPC || 'https://bsc-dataseed.binance.org/',
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],

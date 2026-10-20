@@ -101,7 +101,9 @@ onBeforeUnmount(() => {
 
       <nav class="nav">
         <RouterLink class="nav__link" to="/">矿池</RouterLink>
+        <RouterLink class="nav__link" to="/trade">交易</RouterLink>
         <RouterLink class="nav__link" to="/pod">我的</RouterLink>
+        <RouterLink class="nav__link" to="/about">文档</RouterLink>
       </nav>
 
       <div class="wallet">
@@ -115,12 +117,7 @@ onBeforeUnmount(() => {
           安装钱包
         </a>
 
-        <button
-          v-else-if="!connected"
-          class="wallet__btn"
-          :disabled="connecting"
-          @click="connect"
-        >
+        <button v-else-if="!connected" class="wallet__btn" :disabled="connecting" @click="connect">
           <svg class="wallet__icon" viewBox="0 0 24 24" aria-hidden="true">
             <path
               d="M3 7.5A2.5 2.5 0 0 1 5.5 5H18a3 3 0 0 1 3 3v8a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3z"
@@ -182,11 +179,7 @@ onBeforeUnmount(() => {
             >
               在区块浏览器中查看
             </a>
-            <button
-              class="menu__item menu__item--danger"
-              role="menuitem"
-              @click="disconnect"
-            >
+            <button class="menu__item menu__item--danger" role="menuitem" @click="disconnect">
               断开连接
             </button>
           </div>

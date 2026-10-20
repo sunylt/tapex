@@ -1,7 +1,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 
-import { POD_CONFIG } from '@/pod/config'
+import { POD_CONFIG, STAKING_ENABLED } from '@/pod/config'
 import {
   fetchMinerRefs,
   getReadProvider,
@@ -14,18 +14,19 @@ import {
   switchChain,
   watchWallet,
 } from '@/pod/service'
-import type { MinerRef, MinerStatus, NetworkStats } from '@/pod/types'
+import { readDecomposerOwner, readEarned, readEquity } from '@/pod/tx'
+import type { EquityToken, MinerRef, MinerStatus, NetworkStats } from '@/pod/types'
 
 const POLL_MS = 20_000
 const REFS_CACHE_PREFIX = 'pod:refs:'
 
-function cacheKey(chainId: number, address: string): string {
-  return `${REFS_CACHE_PREFIX}${chainId}:${address.toLowerCase()}`
+function cacheKey(chainId: number, address: string, rpc: string): string {
+  return `${REFS_CACHE_PREFIX}${chainId}:${rpc}:${address.toLowerCase()}`
 }
 
-function loadCachedRefs(chainId: number, address: string): MinerRef[] | null {
+function loadCachedRefs(chainId: number, address: string, rpc: string): MinerRef[] | null {
   try {
-    const raw = localStorage.getItem(cacheKey(chainId, address))
+    const raw = localStorage.getItem(cacheKey(chainId, address, rpc))
     if (!raw) return null
     const parsed: unknown = JSON.parse(raw)
     return Array.isArray(parsed) ? (parsed as MinerRef[]) : null
@@ -34,9 +35,9 @@ function loadCachedRefs(chainId: number, address: string): MinerRef[] | null {
   }
 }
 
-function saveCachedRefs(chainId: number, address: string, refs: MinerRef[]): void {
+function saveCachedRefs(chainId: number, address: string, rpc: string, refs: MinerRef[]): void {
   try {
-    localStorage.setItem(cacheKey(chainId, address), JSON.stringify(refs))
+    localStorage.setItem(cacheKey(chainId, address, rpc), JSON.stringify(refs))
   } catch {
     /* storage unavailable — scan result stays in memory only */
   }
@@ -55,6 +56,12 @@ export const useMiningStore = defineStore('mining', () => {
   const source = ref<'onchain' | null>(null)
   const lastUpdated = ref<number | null>(null)
 
+  /* xNAND / xLATCH 权益与待领收益（链上真实值，见 pod/tx.ts） */
+  const equity = ref<EquityToken[]>([])
+  const earned = ref<bigint>(0n)
+  const poolOwner = ref<string | null>(null)
+  const equityLoaded = ref(false)
+
   // Machine refs are resolved by an (expensive) historical log scan. Cache them
   // per address so the 20s status poll only re-reads cheap on-chain state.
   let refs: MinerRef[] = []
@@ -67,6 +74,14 @@ export const useMiningStore = defineStore('mining', () => {
   const onCorrectChain = computed(() => chainId.value === POD_CONFIG.chainId)
   const activeCount = computed(() => miners.value.filter((m) => m.active).length)
   const totalLive = computed(() => miners.value.reduce((sum, m) => sum + m.live, 0n))
+  /** 拆解金库 owner：只有它能发放收益 */
+  const isPoolOwner = computed(
+    () =>
+      STAKING_ENABLED &&
+      !!address.value &&
+      !!poolOwner.value &&
+      address.value.toLowerCase() === poolOwner.value.toLowerCase(),
+  )
 
   function resetRefs() {
     refs = []
@@ -88,7 +103,7 @@ export const useMiningStore = defineStore('mining', () => {
 
     const net = chainId.value ?? POD_CONFIG.chainId
     if (!force) {
-      const cached = loadCachedRefs(net, current)
+      const cached = loadCachedRefs(net, current, POD_CONFIG.rpc)
       if (cached) {
         refs = cached
         refsLoadedFor = current
@@ -106,11 +121,27 @@ export const useMiningStore = defineStore('mining', () => {
       })
       refs = list
       refsLoadedFor = current
-      saveCachedRefs(net, current, list)
+      saveCachedRefs(net, current, POD_CONFIG.rpc, list)
     } finally {
       scanning.value = false
       scanProgress.value = null
     }
+  }
+
+  /** 读 xNAND / xLATCH 权益、待领收益与金库 owner（单步失败不拖垮整页刷新）。 */
+  async function loadStakeState(owner: string) {
+    if (!STAKING_ENABLED) return
+    const [equityResult, earnedResult, ownerResult] = await Promise.allSettled([
+      readEquity(owner),
+      readEarned(owner),
+      readDecomposerOwner(),
+    ])
+    if (equityResult.status === 'fulfilled') {
+      equity.value = equityResult.value
+      equityLoaded.value = true
+    }
+    if (earnedResult.status === 'fulfilled') earned.value = earnedResult.value
+    if (ownerResult.status === 'fulfilled') poolOwner.value = ownerResult.value
   }
 
   /** Load machines + mining status for the current address. */
@@ -123,9 +154,11 @@ export const useMiningStore = defineStore('mining', () => {
       getReadProvider()
       await resolveRefs(!!options.rescan)
       const current = refs
+      const owner = address.value
       const [statuses, network] = await Promise.all([
         Promise.all(current.map((ref) => readMinerStatus(ref))),
         readNetworkStats().catch(() => null),
+        loadStakeState(owner),
       ])
       miners.value = statuses.sort(
         (a, b) => Number(b.active) - Number(a.active) || a.ref.circuitId - b.ref.circuitId,
@@ -212,6 +245,10 @@ export const useMiningStore = defineStore('mining', () => {
     stats.value = null
     source.value = null
     error.value = null
+    equity.value = []
+    earned.value = 0n
+    poolOwner.value = null
+    equityLoaded.value = false
   }
 
   function startPolling() {
@@ -250,10 +287,15 @@ export const useMiningStore = defineStore('mining', () => {
     stats,
     source,
     lastUpdated,
+    equity,
+    earned,
+    poolOwner,
+    equityLoaded,
     connected,
     onCorrectChain,
     activeCount,
     totalLive,
+    isPoolOwner,
     connect,
     switchToBsc,
     disconnect,
